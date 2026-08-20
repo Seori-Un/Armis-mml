@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>Armis MML 변환기</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{
+    --bg:#0b0d10; --panel:#131720; --text:#dde3ea; --muted:#9aa6b2;
+    --line:#1f2430; --chip:#1a2130; --accent:#63b3ed;
+    --ok:#9fe3b4; --warn:#ffd580; --bad:#ff9aa2;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",Arial,sans-serif}
+  header{padding:28px 16px;text-align:center}
+  h1{margin:0;font-size:24px}
+  .subtitle{color:var(--muted);margin-top:6px;font-size:14px}
+  main{max-width:980px;margin:0 auto;padding:0 16px 64px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin:12px 0}
+  .uploader{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  input[type=file]{padding:10px;border:1px dashed var(--line);border-radius:10px;background:#0f1420;color:var(--text)}
+  .hint{color:var(--muted);font-size:12px}
+  .track{background:#0f1420;border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0}
+  .row{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;
+    border-bottom:1px dashed var(--line);padding-bottom:8px;margin-bottom:8px}
+  .badge{display:inline-flex;gap:8px;align-items:center;background:var(--chip);
+    border-radius:999px;padding:4px 10px;color:var(--accent);font-size:12px}
+  .meta{color:var(--muted);font-size:12px;margin-left:8px}
+  textarea{width:100%;min-height:140px;resize:vertical;background:#0c111c;color:var(--text);
+    border:1px solid var(--line);border-radius:8px;padding:10px;
+    font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px;line-height:1.5}
+  button{padding:7px 12px;border-radius:8px;border:1px solid var(--line);
+    background:var(--chip);color:var(--text);cursor:pointer;font-size:13px}
+  button:hover{filter:brightness(1.15)}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .copy{color:var(--ok)}
+  .loading{display:none;color:var(--muted);font-size:12px}
+  .error{color:var(--bad);white-space:pre-wrap;margin-top:8px}
+  .warning{color:var(--warn);font-size:12px;margin-top:8px;white-space:pre-wrap}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:4px}
+  .empty{color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Armis MML 변환기</h1>
+  <p class="subtitle">MIDI 파일을 올리면 트랙·채널별 MML을 만듭니다.</p>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="uploader">
+      <input id="file" type="file" accept=".mid,.midi" />
+      <span id="ppq" class="hint"></span>
+      <span id="loading" class="loading">변환 중…</span>
+    </div>
+    <div id="err" class="error"></div>
+    <div id="warning" class="warning"></div>
+  </section>
+
+  <section class="panel">
+    <div class="toolbar">
+      <h3 style="margin:0 8px 0 0;flex:1">결과</h3>
+      <button id="copyAll">전체 복사</button>
+      <button id="download">.txt로 저장</button>
+    </div>
+    <div id="tracks"><p class="empty">아직 변환한 파일이 없습니다.</p></div>
+  </section>
+</main>
+
+<script>
+/* ============================================================
+   설정
+   ============================================================
+   RESOLUTION = 표현 가능한 가장 짧은 음표의 분모.
+   32 이면 1/32음표가 최소 단위이고, 1 unit = 1/32음표.
+   4분음표 = 8 units, 온음표 = 32 units.
+
+   셋잇단음표를 살리려면 96(=32*3)으로 올려야 하지만
+   그 경우 아래 LENGTH_CANDIDATES가 3배수를 다루도록
+   함께 고쳐야 한다.
+   ============================================================ */
+const RESOLUTION = 32;
+
+/* 화음 구성음의 길이를 맞추는 방식.
+   "min"  : 가장 짧은 음에 맞춤 (원본 note-off보다 길어지지 않음)
+   "max"  : 가장 긴 음에 맞춤 (울림 유지, 다음 음과 겹칠 수 있음)
+   "first": 가장 낮은 음의 길이 사용 */
+const CHORD_DURATION_MODE = "min";
+
+const VEL_MIN = 0;
+const VEL_MAX = 15;
+const AUTO_BOOT_VELOCITY = true;   // 곡 전체 최대 velocity를 15로 끌어올림
+const INITIAL_TEMPO = 120;
+
+/* ============================================================
+   악기 맵 (General MIDI)
+   ============================================================ */
+const INSTRUMENT_MAP = ["acoustic grand piano","bright acoustic piano","electric grand piano","honky-tonk piano","electric piano 1","electric piano 2","harpsichord","clavi","celesta","glockenspiel","music box","vibraphone","marimba","xylophone","tubular bells","dulcimer","drawbar organ","percussive organ","rock organ","church organ","reed organ","accordion","harmonica","tango accordion","acoustic guitar (nylon)","acoustic guitar (steel)","electric guitar (jazz)","electric guitar (clean)","electric guitar (muted)","overdriven guitar","distortion guitar","guitar harmonics","acoustic bass","electric bass (finger)","electric bass (pick)","fretless bass","slap bass 1","slap bass 2","synth bass 1","synth bass 2","violin","viola","cello","contrabass","tremolo strings","pizzicato strings","orchestral harp","timpani","string ensemble 1","string ensemble 2","synthstrings 1","synthstrings 2","choir aahs","voice oohs","synth voice","orchestra hit","trumpet","trombone","tuba","muted trumpet","french horn","brass section","synthbrass 1","synthbrass 2","soprano sax","alto sax","tenor sax","baritone sax","oboe","english horn","bassoon","clarinet","piccolo","flute","recorder","pan flute","blown bottle","shakuhachi","whistle","ocarina","lead 1 (square)","lead 2 (sawtooth)","lead 3 (calliope)","lead 4 (chiff)","lead 5 (charang)","lead 6 (voice)","lead 7 (fifths)","lead 8 (bass + lead)","pad 1 (new age)","pad 2 (warm)","pad 3 (polysynth)","pad 4 (choir)","pad 5 (bowed)","pad 6 (metallic)","pad 7 (halo)","pad 8 (sweep)","fx 1 (rain)","fx 2 (soundtrack)","fx 3 (crystal)","fx 4 (atmosphere)","fx 5 (brightness)","fx 6 (goblins)","fx 7 (echoes)","fx 8 (sci-fi)","sitar","banjo","shamisen","koto","kalimba","bag pipe","fiddle","shanai","tinkle bell","agogo","steel drums","woodblock","taiko drum","melodic tom","synth drum","reverse cymbal","guitar fret noise","breath noise","seashore","bird tweet","telephone ring","helicopter","applause","gunshot"];
+
+const PITCH_CLASS = ["c","c+","d","d+","e","f","f+","g","g+","a","a+","b"];
+const REST = "r";
+
+/* ============================================================
+   음가 후보 (모듈 로드 시 1회만 계산)
+   ============================================================ */
+const LENGTH_CANDIDATES = (() => {
+  const out = [];
+  for (let units = RESOLUTION; units >= 1; units = Math.floor(units / 2)) {
+    const value = RESOLUTION / units;          // MML에 찍히는 숫자
+    out.push({ units, value, dotted: false });
+    const dottedUnits = units + Math.floor(units / 2);
+    if (dottedUnits > units) out.push({ units: dottedUnits, value, dotted: true });
+  }
+  // 긴 음가 우선, 같은 길이면 점음표 우선
+  out.sort((a, b) => (b.units - a.units) || (Number(b.dotted) - Number(a.dotted)));
+  return out;
+})();
+
+/* 길이(units)를 MML 문자열로. 한 토큰으로 안 되면 &로 잇는다. */
+function lengthToMml(units, noteClass) {
+  units = Math.max(0, Math.round(units));
+  if (units <= 0) return "";
+  const parts = [];
+  let remaining = units;
+  while (remaining > 0) {
+    let pick = LENGTH_CANDIDATES.find(c => c.units <= remaining);
+    if (!pick) pick = { units: 1, value: RESOLUTION, dotted: false };
+    parts.push(noteClass + pick.value + (pick.dotted ? "." : ""));
+    remaining -= pick.units;
+  }
+  return parts.join("&");
+}
+
+/* ============================================================
+   변환 유틸
+   ============================================================ */
+function tickPerUnit(ppq) { return (ppq * 4) / RESOLUTION; }
+function quantize(tick, ppq) {
+  const u = tickPerUnit(ppq);
+  return (!isFinite(u) || u <= 0) ? 0 : Math.round(tick / u);
+}
+function keyToPitchClass(k) { return PITCH_CLASS[((k % 12) + 12) % 12]; }
+function keyToOctave(k) { return k < 12 ? 0 : Math.trunc(k / 12) - 1; }
+function velocityToMml(v) {
+  const val = Math.trunc((v * (VEL_MAX - VEL_MIN)) / 127) + VEL_MIN;
+  return Math.max(VEL_MIN, Math.min(VEL_MAX, val));
+}
+function microsToBpm(micros) {
+  if (!isFinite(micros) || micros <= 0) return INITIAL_TEMPO;
+  return Math.max(1, Math.min(1000, Math.round(60000000 / micros)));
+}
+
+/* ============================================================
+   SMF 파서
+   ============================================================ */
+function readU32(b, i) { return ((b[i] << 24) | (b[i+1] << 16) | (b[i+2] << 8) | b[i+3]) >>> 0; }
+function readU16(b, i) { return ((b[i] << 8) | b[i+1]) >>> 0; }
+
+function readVar(b, i) {
+  let value = 0, pos = i, byte;
+  do {
+    if (pos >= b.length) throw new Error("MIDI 가변길이 값이 잘렸습니다.");
+    byte = b[pos++];
+    value = (value << 7) | (byte & 0x7f);
+  } while (byte & 0x80);
+  return { value, next: pos };
+}
+
+function parseSMF(buffer) {
+  const b = new Uint8Array(buffer);
+  let i = 0;
+
+  function chunk() {
+    if (i + 8 > b.length) throw new Error("MIDI 청크가 손상되었습니다.");
+    const id = String.fromCharCode(b[i], b[i+1], b[i+2], b[i+3]);
+    i += 4;
+    const len = readU32(b, i);
+    i += 4;
+    if (i + len > b.length) throw new Error("MIDI 청크 길이가 파일 크기를 넘습니다.");
+    const data = b.slice(i, i + len);
+    i += len;
+    return { id, data };
+  }
+
+  const head = chunk();
+  if (head.id !== "MThd") throw new Error("MIDI 헤더(MThd)를 찾지 못했습니다.");
+  if (head.data.length < 6) throw new Error("MIDI 헤더가 너무 짧습니다.");
+
+  const format = readU16(head.data, 0);
+  const ntrks  = readU16(head.data, 2);
+  const division = readU16(head.data, 4);
+
+  if ((division & 0x8000) !== 0) {
+    throw new Error("SMPTE 기준 MIDI는 지원하지 않습니다. PPQ 기준 파일로 저장한 뒤 다시 올려주세요.");
+  }
+  const ppq = division & 0x7fff;
+  if (ppq <= 0) throw new Error("PPQ 값이 올바르지 않습니다.");
+
+  const tracks = [];
+  for (let t = 0; t < ntrks && i < b.length; t++) {
+    const c = chunk();
+    if (c.id !== "MTrk") continue;
+
+    const d = c.data;
+    let pos = 0, tick = 0, running = null;
+    const events = [];
+
+    while (pos < d.length) {
+      const delta = readVar(d, pos);
+      pos = delta.next;
+      tick += delta.value;
+      if (pos >= d.length) break;
+
+      const status = d[pos];
+      if (status < 0x80) {
+        if (running === null) throw new Error("running status 없이 데이터 바이트가 나왔습니다.");
+      } else {
+        pos++;
+        running = status;
+      }
+
+      // 메타 이벤트
+      if (running === 0xFF) {
+        if (pos >= d.length) break;
+        const metaType = d[pos++];
+        const len = readVar(d, pos);
+        pos = len.next;
+        const payload = d.slice(pos, pos + len.value);
+        pos += len.value;
+        if (metaType === 0x51 && payload.length === 3) {
+          const micros = (payload[0] << 16) | (payload[1] << 8) | payload[2];
+          events.push({ tick, type: "tempo", bpm: microsToBpm(micros) });
+        }
+        running = null;      // 메타는 running status를 취소한다
+        if (metaType === 0x2F) break;
+        continue;
+      }
+
+      // SysEx
+      if (running === 0xF0 || running === 0xF7) {
+        const len = readVar(d, pos);
+        pos = len.next + len.value;
+        running = null;      // SysEx도 running status를 취소한다
+        continue;
+      }
+
+      const hi = running & 0xF0;
+      const ch = running & 0x0F;
+
+      if (hi === 0x90 || hi === 0x80) {
+        if (pos + 2 > d.length) break;
+        const key = d[pos++], vel = d[pos++];
+        const isOn = (hi === 0x90 && vel > 0);
+        events.push({ tick, type: isOn ? "on" : "off", ch, key, vel });
+      } else if (hi === 0xC0) {
+        if (pos + 1 > d.length) break;
+        events.push({ tick, type: "program", ch, program: d[pos++] });
+      } else if (hi === 0xA0 || hi === 0xB0 || hi === 0xE0) {
+        pos += 2;
+      } else if (hi === 0xD0) {
+        pos += 1;
+      }
+    }
+    tracks.push(events);
+  }
+
+  return { format, ppq, tracks };
+}
+
+/* ============================================================
+   노트 추출 — (트랙, 채널)별로 분리
+   ============================================================ */
+function collectParts(smf) {
+  const parts = new Map();   // "trackIndex:channel" -> part
+  const tempos = [];         // {tick, bpm}
+  let endTick = 0;
+
+  smf.tracks.forEach((events, trackIndex) => {
+    const holding = new Map();  // "ch:key" -> [note, ...]
+
+    const partOf = (ch) => {
+      const id = trackIndex + ":" + ch;
+      if (!parts.has(id)) {
+        parts.set(id, { id, trackIndex, channel: ch, program: null, notes: [] });
+      }
+      return parts.get(id);
+    };
+
+    const openNote = (ch, key, vel, tick) => {
+      const k = ch + ":" + key;
+      if (!holding.has(k)) holding.set(k, []);
+      holding.get(k).push({ key, velocity: vel, startTick: tick, endTick: tick, ch });
+    };
+
+    const closeNote = (ch, key, tick) => {
+      const k = ch + ":" + key;
+      const stack = holding.get(k);
+      if (!stack || !stack.length) return;
+      const note = stack.pop();          // 겹친 같은 음은 최근 것부터 닫는다
+      note.endTick = Math.max(note.startTick, tick);
+      partOf(ch).notes.push(note);
+      if (!stack.length) holding.delete(k);
+    };
+
+    for (const ev of events) {
+      endTick = Math.max(endTick, ev.tick);
+      if (ev.type === "tempo") { tempos.push({ tick: ev.tick, bpm: ev.bpm }); continue; }
+      if (ev.type === "program") { const p = partOf(ev.ch); if (p.program === null) p.program = ev.program; continue; }
+      if (ev.type === "on")  { openNote(ev.ch, ev.key, ev.vel, ev.tick); continue; }
+      if (ev.type === "off") { closeNote(ev.ch, ev.key, ev.tick); continue; }
+    }
+
+    // 닫히지 않은 음은 트랙 끝에서 닫는다
+    for (const [k, stack] of holding) {
+      const ch = Number(k.split(":")[0]);
+      for (const note of stack) {
+        note.endTick = Math.max(note.startTick, endTick);
+        partOf(ch).notes.push(note);
+      }
+    }
+  });
+
+  return {
+    parts: [...parts.values()].filter(p => p.notes.length > 0),
+    tempos,
+    endTick
+  };
+}
+
+/* 같은 tick의 템포는 마지막 값만, 값이 안 바뀌면 버린다 */
+function normalizeTempos(raw, ppq) {
+  const byTick = new Map();
+  for (const t of raw) byTick.set(t.tick, t.bpm);
+  const sorted = [...byTick.entries()].sort((a, b) => a[0] - b[0]);
+
+  const out = [];
+  let last = null;
+  if (!sorted.length || sorted[0][0] > 0) { out.push({ pos: 0, bpm: INITIAL_TEMPO }); last = INITIAL_TEMPO; }
+  for (const [tick, bpm] of sorted) {
+    if (bpm === last) continue;
+    out.push({ pos: quantize(tick, ppq), bpm });
+    last = bpm;
+  }
+  // 양자화 후 같은 자리에 몰린 템포는 마지막 것만
+  const merged = [];
+  for (const t of out) {
+    if (merged.length && merged[merged.length - 1].pos === t.pos) merged[merged.length - 1] = t;
+    else merged.push(t);
+  }
+  return merged;
+}
+
+/* ============================================================
+   MML 이벤트 생성
+   ============================================================
+   위치를 사후에 보정하지 않는다. 대신 각 화음 그룹의 길이를
+   "다음 그룹이 시작하기 전까지"로 미리 잘라두기 때문에
+   커서가 뒤로 밀릴 일이 구조적으로 생기지 않는다.
+   ============================================================ */
+function buildEvents(part, tempos, ppq) {
+  const notes = part.notes.map(n => ({
+    key: n.key,
+    pitch: keyToPitchClass(n.key),
+    octave: keyToOctave(n.key),
+    velocity: velocityToMml(n.velocity),
+    start: quantize(n.startTick, ppq),
+    duration: Math.max(0, quantize(n.endTick, ppq) - quantize(n.startTick, ppq))
+  })).sort((a, b) => (a.start - b.start) || (a.key - b.key));
+
+  // 같은 시작점 = 한 화음
+  const groups = [];
+  for (const n of notes) {
+    const last = groups[groups.length - 1];
+    if (last && last.start === n.start) {
+      if (!last.notes.some(x => x.key === n.key)) last.notes.push(n);  // 같은 음 중복 제거
+    } else {
+      groups.push({ start: n.start, notes: [n] });
+    }
+  }
+
+  // 그룹 길이 결정 + 다음 그룹 시작점까지로 클램프
+  groups.forEach((g, idx) => {
+    const durations = g.notes.map(n => n.duration);
+    let dur;
+    if (CHORD_DURATION_MODE === "max") dur = Math.max(...durations);
+    else if (CHORD_DURATION_MODE === "first") dur = durations[0];
+    else dur = Math.min(...durations);
+
+    const next = groups[idx + 1];
+    if (next) dur = Math.min(dur, next.start - g.start);
+    g.duration = Math.max(1, dur);
+  });
+
+  // 템포 + 화음을 한 타임라인으로
+  const timeline = [
+    ...tempos.map(t => ({ pos: t.pos, order: 0, tempo: t.bpm })),
+    ...groups.map(g => ({ pos: g.start, order: 1, group: g }))
+  ].sort((a, b) => (a.pos - b.pos) || (a.order - b.order));
+
+  const events = [];
+  let cursor = 0, lastOctave = null, lastVelocity = null, lastTempo = null;
+
+  for (const item of timeline) {
+    if (item.pos > cursor) {
+      events.push({ type: "Rest", units: item.pos - cursor });
+      cursor = item.pos;
+    }
+
+    if (item.group === undefined) {
+      // 음표 중간에 걸린 템포는 가장 가까운 다음 경계로 밀린다
+      if (item.tempo !== lastTempo) {
+        events.push({ type: "Tempo", tempo: item.tempo });
+        lastTempo = item.tempo;
+      }
+      continue;
+    }
+
+    const g = item.group;
+    // velocity는 화음 단위로 한 번만 (Armis 화음 안에는 o만 넣는다)
+    const vel = Math.max(...g.notes.map(n => n.velocity));
+    if (vel !== lastVelocity) {
+      events.push({ type: "Velocity", value: vel });
+      lastVelocity = vel;
+    }
+
+    g.notes.forEach((n, idx) => {
+      if (idx > 0) events.push({ type: "ConnectChord" });
+      if (n.octave !== lastOctave) {
+        events.push({ type: "Octave", value: n.octave });
+        lastOctave = n.octave;
+      }
+      events.push({ type: "Note", pitch: n.pitch, units: g.duration });
+    });
+
+    cursor += g.duration;
+  }
+
+  return events;
+}
+
+function eventToMml(e) {
+  switch (e.type) {
+    case "ConnectChord": return ":";
+    case "Tempo":        return "t" + e.tempo;
+    case "Octave":       return "o" + e.value;
+    case "Velocity":     return "v" + e.value;
+    case "Rest":         return lengthToMml(e.units, REST);
+    case "Note":         return lengthToMml(e.units, e.pitch);
+    default:             return "";
+  }
+}
+
+/* ============================================================
+   트랙 / 곡
+   ============================================================ */
+function instrumentName(part) {
+  if (part.channel === 9) return "Drum Set";
+  const id = part.program === null ? 0 : part.program;
+  return INSTRUMENT_MAP[id] || INSTRUMENT_MAP[0];
+}
+
+function convert(buffer) {
+  const smf = parseSMF(buffer);
+  const { parts, tempos } = collectParts(smf);
+  const tempoList = normalizeTempos(tempos, smf.ppq);
+
+  const tracks = parts.map(part => {
+    const events = buildEvents(part, tempoList, smf.ppq);
+    return {
+      label: "T" + part.trackIndex + " · ch" + part.channel,
+      instrument: instrumentName(part),
+      channel: part.channel,
+      noteCount: part.notes.length,
+      events
+    };
+  }).filter(t => t.events.some(e => e.type === "Note"));
+
+  if (AUTO_BOOT_VELOCITY && tracks.length) {
+    let vmax = 0;
+    for (const t of tracks) for (const e of t.events) if (e.type === "Velocity") vmax = Math.max(vmax, e.value);
+    const diff = VEL_MAX - vmax;
+    if (diff > 0) {
+      for (const t of tracks) for (const e of t.events) if (e.type === "Velocity") e.value += diff;
+    }
+  }
+
+  for (const t of tracks) t.mml = t.events.map(eventToMml).join("");
+  return { ppq: smf.ppq, format: smf.format, tracks, tempoList };
+}
+
+/* ==== UI ==== */
+const $ = s => document.querySelector(s);
+const fileEl = $("#file"), tracksEl = $("#tracks"), ppqEl = $("#ppq");
+const loadingEl = $("#loading"), errEl = $("#err"), warnEl = $("#warning");
+let currentSong = null;
+
+fileEl.addEventListener("change", async ev => {
+  errEl.textContent = ""; warnEl.textContent = ""; ppqEl.textContent = "";
+  tracksEl.innerHTML = ""; currentSong = null;
+  loadingEl.style.display = "inline";
+
+  try {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) { tracksEl.innerHTML = '<p class="empty">아직 변환한 파일이 없습니다.</p>'; return; }
+
+    const song = convert(await file.arrayBuffer());
+    currentSong = song;
+
+    ppqEl.textContent = `PPQ ${song.ppq} · format ${song.format} · 트랙 ${song.tracks.length}개`;
+
+    const notes = [];
+    if (!Number.isInteger(tickPerUnit(song.ppq))) {
+      notes.push(`PPQ ${song.ppq}에서는 1/${RESOLUTION} 단위가 정수 tick으로 떨어지지 않습니다. 가장 가까운 자리로 맞춥니다.`);
+    }
+    notes.push(`셋잇단음표와 스윙은 1/${RESOLUTION} 격자로 반올림됩니다.`);
+    warnEl.textContent = notes.join("\n");
+
+    if (!song.tracks.length) {
+      tracksEl.innerHTML = '<p class="empty">음표가 있는 트랙을 찾지 못했습니다.</p>';
+      return;
+    }
+
+    for (const t of song.tracks) {
+      const card = document.createElement("div"); card.className = "track";
+      const row = document.createElement("div"); row.className = "row";
+
+      const left = document.createElement("div");
+      const badge = document.createElement("span"); badge.className = "badge";
+      badge.textContent = `${t.label} · ${t.instrument}`;
+      const meta = document.createElement("span"); meta.className = "meta";
+      meta.textContent = `음표 ${t.noteCount}개, ${t.mml.length}자`;
+      left.append(badge, meta);
+
+      const copy = document.createElement("button"); copy.className = "copy"; copy.textContent = "복사";
+      copy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(t.mml);
+          copy.textContent = "복사함";
+        } catch { copy.textContent = "복사 실패"; }
+        setTimeout(() => { copy.textContent = "복사"; }, 1200);
+      };
+
+      row.append(left, copy);
+
+      const ta = document.createElement("textarea");
+      ta.value = t.mml; ta.spellcheck = false;
+      ta.setAttribute("aria-label", t.label + " MML");
+
+      card.append(row, ta);
+      tracksEl.appendChild(card);
+    }
+  } catch (e) {
+    console.error(e);
+    errEl.textContent = e.message || String(e);
+    tracksEl.innerHTML = '<p class="empty">변환하지 못했습니다.</p>';
+  } finally {
+    loadingEl.style.display = "none";
+  }
+});
+
+function allText() {
+  if (!currentSong) return "";
+  return currentSong.tracks.map(t => `; ${t.label} — ${t.instrument}\n${t.mml}`).join("\n\n");
+}
+
+$("#copyAll").onclick = async () => {
+  const btn = $("#copyAll");
+  if (!currentSong) { btn.textContent = "먼저 파일을 올려주세요"; setTimeout(() => btn.textContent = "전체 복사", 1500); return; }
+  try { await navigator.clipboard.writeText(allText()); btn.textContent = "복사함"; }
+  catch { btn.textContent = "복사 실패"; }
+  setTimeout(() => btn.textContent = "전체 복사", 1200);
+};
+
+$("#download").onclick = () => {
+  const btn = $("#download");
+  if (!currentSong) { btn.textContent = "먼저 파일을 올려주세요"; setTimeout(() => btn.textContent = ".txt로 저장", 1500); return; }
+  const blob = new Blob([allText()], { type: "text/plain;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "armis-mml.txt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+</script>
+</body>
+</html>
