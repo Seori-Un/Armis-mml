@@ -20,6 +20,8 @@
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin:12px 0}
   .uploader{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   input[type=file]{padding:10px;border:1px dashed var(--line);border-radius:10px;background:#0f1420;color:var(--text)}
+  select{padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#0f1420;color:var(--text);font-size:13px}
+  label.opt{display:inline-flex;gap:6px;align-items:center;color:var(--muted);font-size:12px}
   .hint{color:var(--muted);font-size:12px}
   .track{background:#0f1420;border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0}
   .row{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;
@@ -53,6 +55,13 @@
   <section class="panel">
     <div class="uploader">
       <input id="file" type="file" accept=".mid,.midi" />
+      <label class="opt">양자화
+        <select id="quantize">
+          <option value="hybrid" selected>하이브리드 (2분할+셋잇단)</option>
+          <option value="binary">2분할만 (1/32)</option>
+          <option value="none">끄기 (원본 그대로)</option>
+        </select>
+      </label>
       <span id="ppq" class="hint"></span>
       <span id="loading" class="loading">변환 중…</span>
     </div>
@@ -74,15 +83,37 @@
 /* ============================================================
    설정
    ============================================================
-   RESOLUTION = 표현 가능한 가장 짧은 음표의 분모.
-   32 이면 1/32음표가 최소 단위이고, 1 unit = 1/32음표.
-   4분음표 = 8 units, 온음표 = 32 units.
+   내부 해상도를 tick 단위로 다룬다. (MabiIcco의 MMLTickTable.TPQN 방식)
 
-   셋잇단음표를 살리려면 96(=32*3)으로 올려야 하지만
-   그 경우 아래 LENGTH_CANDIDATES가 3배수를 다루도록
-   함께 고쳐야 한다.
+   TPQN = 96  →  4분음표 96 tick, 온음표 384 tick.
+   이 값에서는 2분할과 3분할이 모두 정수로 떨어진다.
+     1/32 = 12,  1/64 = 6
+     8분 셋잇단(l12) = 32,  16분 셋잇단(l24) = 16,  32분 셋잇단(l48) = 8
+   예전처럼 "1/32 격자에 반올림"하지 않으므로 셋잇단이 깨지지 않는다.
    ============================================================ */
-const RESOLUTION = 32;
+const TPQN  = 96;
+const WHOLE = TPQN * 4;   // 온음표 tick
+
+/* Armis가 받아들이는 음표 길이 토큰. (게임에서 동작 확인 완료)
+   게임이 특정 값을 거부하면 여기서 빼기만 하면 된다.
+   3/6/12/24/48 이 셋잇단음표용.
+   (MabiIcco의 tickInvTableForMb 구성 + 2분음표 셋잇단 "3")
+
+   TPQN 96에서 정수 tick으로 떨어지는 분모만 쓸 수 있다.
+   1,2,3,4,6,8,12,16,24,32,48,64 이 그 목록이고,
+   5나 7 같은 값은 tick이 나누어떨어지지 않아 넣어도 무시된다. */
+const LENGTH_TOKENS = ["1","1.","2","2.","3","4","4.","8","8.","16","16.","32","32.","64","64.","6","12","24","48"];
+
+/* 한 음을 최대 몇 개 토큰까지 &로 이어붙일지 (MabiIcco COMBN) */
+const COMBN = 3;
+
+/* 양자화 방식
+   "hybrid" : 2분할 격자와 3분할 격자 중 가까운 쪽으로 스냅 → 셋잇단 보존
+   "binary" : 2분할 격자만
+   "none"   : 스냅하지 않고 원본 tick 그대로 (연주 데이터의 흔들림까지 그대로) */
+let QUANTIZE_MODE = "hybrid";
+const BINARY_GRID  = WHOLE / 32;   // 12 tick = 1/32음표
+const TRIPLET_GRID = WHOLE / 24;   // 16 tick = 1/24음표(16분 셋잇단)
 
 /* 화음 구성음의 길이를 맞추는 방식.
    "min"  : 가장 짧은 음에 맞춤 (원본 note-off보다 길어지지 않음)
@@ -104,44 +135,115 @@ const PITCH_CLASS = ["c","c+","d","d+","e","f","f+","g","g+","a","a+","b"];
 const REST = "r";
 
 /* ============================================================
-   음가 후보 (모듈 로드 시 1회만 계산)
+   tick 테이블 (모듈 로드 시 1회 생성)
+   ============================================================
+   MabiIcco MMLTickTable.generateInvTable 이식.
+   토큰 1~COMBN개를 더해서 만들 수 있는 모든 tick 길이를 미리 만들어 두고,
+   가장 짧게 표기되는 조합을 정답으로 저장한다.
+   덕분에 "tick 길이 → MML"이 반올림 없이 정확히 떨어진다.
    ============================================================ */
-const LENGTH_CANDIDATES = (() => {
-  const out = [];
-  for (let units = RESOLUTION; units >= 1; units = Math.floor(units / 2)) {
-    const value = RESOLUTION / units;          // MML에 찍히는 숫자
-    out.push({ units, value, dotted: false });
-    const dottedUnits = units + Math.floor(units / 2);
-    if (dottedUnits > units) out.push({ units: dottedUnits, value, dotted: true });
+function tokenTick(token) {
+  const dot = token.endsWith(".");
+  const n = parseInt(dot ? token.slice(0, -1) : token, 10);
+  if (!n) return 0;
+  let t = WHOLE / n;
+  if (!Number.isInteger(t)) return 0;
+  if (dot) {
+    if (t % 2 !== 0) return 0;
+    t += t / 2;
   }
-  // 긴 음가 우선, 같은 길이면 점음표 우선
-  out.sort((a, b) => (b.units - a.units) || (Number(b.dotted) - Number(a.dotted)));
-  return out;
+  return t;
+}
+
+const TOKENS = LENGTH_TOKENS
+  .map(name => ({ name, tick: tokenTick(name) }))
+  .filter(x => x.tick > 0)
+  .sort((a, b) => b.tick - a.tick);
+
+const MIN_TICK = Math.min(...TOKENS.map(t => t.tick));   // 표현 가능한 최소 길이
+
+const TICK_TABLE = (() => {
+  const map = new Map();
+  // MabiIcco patternLength와 같은 취지: 토큰 수가 적고 짧게 찍히는 쪽이 이긴다
+  const cost = list => list.reduce((s, n) => s + n.length, 0) + list.length * 10;
+  const limit = WHOLE * 2;
+
+  const walk = (from, chosen, total) => {
+    if (chosen.length) {
+      const cur = map.get(total);
+      if (!cur || cost(chosen) < cost(cur)) map.set(total, chosen.slice());
+    }
+    if (chosen.length >= COMBN) return;
+    for (let i = from; i < TOKENS.length; i++) {
+      const next = total + TOKENS[i].tick;
+      if (next > limit) continue;
+      chosen.push(TOKENS[i].name);
+      walk(i, chosen, next);
+      chosen.pop();
+    }
+  };
+  walk(0, [], 0);
+  return map;
 })();
 
-/* 길이(units)를 MML 문자열로. 한 토큰으로 안 되면 &로 잇는다. */
-function lengthToMml(units, noteClass) {
-  units = Math.max(0, Math.round(units));
-  if (units <= 0) return "";
-  const parts = [];
-  let remaining = units;
-  while (remaining > 0) {
-    let pick = LENGTH_CANDIDATES.find(c => c.units <= remaining);
-    if (!pick) pick = { units: 1, value: RESOLUTION, dotted: false };
-    parts.push(noteClass + pick.value + (pick.dotted ? "." : ""));
-    remaining -= pick.units;
+const TICK_KEYS = [...TICK_TABLE.keys()].sort((a, b) => a - b);
+
+/* 주어진 값 이하 중 표현 가능한 가장 큰 tick */
+function largestFitting(tick) {
+  let lo = 0, hi = TICK_KEYS.length - 1, best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (TICK_KEYS[mid] <= tick) { best = TICK_KEYS[mid]; lo = mid + 1; }
+    else hi = mid - 1;
   }
-  return parts.join("&");
+  return best;
+}
+
+/* tick 길이 → MML 문자열.
+   반환값의 tick은 "실제로 찍힌 길이"다. 요청 길이와 다를 수 있으므로
+   커서 계산에는 반드시 이 값을 쓴다. (박자 밀림 방지의 핵심)
+   tie=false 이면 &로 잇지 않는다. 쉼표는 tie를 쓰면 안 되므로 false.
+   (MabiIcco MMLTicks의 needTie와 동일) */
+function ticksToMml(name, tick, tie) {
+  let rem = Math.max(0, Math.round(tick));
+  const out = [];
+  let used = 0;
+
+  // 아주 긴 음: "1."을 반복해서 줄인다 (MMLTicks.toMMLText)
+  const dottedWhole = tokenTick("1.");
+  while (rem > WHOLE * 2) { out.push("1."); rem -= dottedWhole; used += dottedWhole; }
+
+  while (rem >= MIN_TICK) {
+    const exact = TICK_TABLE.get(rem);
+    if (exact) { out.push(...exact); used += rem; rem = 0; break; }
+    const fit = largestFitting(rem);
+    if (!fit) break;
+    out.push(...TICK_TABLE.get(fit));
+    used += fit;
+    rem -= fit;
+  }
+
+  return { text: out.map(t => name + t).join(tie ? "&" : ""), tick: used };
 }
 
 /* ============================================================
    변환 유틸
    ============================================================ */
-function tickPerUnit(ppq) { return (ppq * 4) / RESOLUTION; }
-function quantize(tick, ppq) {
-  const u = tickPerUnit(ppq);
-  return (!isFinite(u) || u <= 0) ? 0 : Math.round(tick / u);
+/* 원본 tick → 내부 TPQN tick (MabiIcco MidiFile.convTick) */
+function toTick(tick, ppq) {
+  if (!isFinite(ppq) || ppq <= 0) return 0;
+  return Math.round((tick * TPQN) / ppq);
 }
+
+/* 격자 스냅. 2분할·3분할 중 가까운 쪽을 고르므로 셋잇단이 살아남는다. */
+function snap(tick) {
+  if (QUANTIZE_MODE === "none") return tick;
+  const b = Math.round(tick / BINARY_GRID) * BINARY_GRID;
+  if (QUANTIZE_MODE === "binary") return b;
+  const t = Math.round(tick / TRIPLET_GRID) * TRIPLET_GRID;
+  return Math.abs(tick - b) <= Math.abs(tick - t) ? b : t;
+}
+
 function keyToPitchClass(k) { return PITCH_CLASS[((k % 12) + 12) % 12]; }
 function keyToOctave(k) { return k < 12 ? 0 : Math.trunc(k / 12) - 1; }
 function velocityToMml(v) {
@@ -341,10 +443,10 @@ function normalizeTempos(raw, ppq) {
   if (!sorted.length || sorted[0][0] > 0) { out.push({ pos: 0, bpm: INITIAL_TEMPO }); last = INITIAL_TEMPO; }
   for (const [tick, bpm] of sorted) {
     if (bpm === last) continue;
-    out.push({ pos: quantize(tick, ppq), bpm });
+    out.push({ pos: snap(toTick(tick, ppq)), bpm });
     last = bpm;
   }
-  // 양자화 후 같은 자리에 몰린 템포는 마지막 것만
+  // 스냅 후 같은 자리에 몰린 템포는 마지막 것만
   const merged = [];
   for (const t of out) {
     if (merged.length && merged[merged.length - 1].pos === t.pos) merged[merged.length - 1] = t;
@@ -356,9 +458,18 @@ function normalizeTempos(raw, ppq) {
 /* ============================================================
    MML 이벤트 생성
    ============================================================
-   위치를 사후에 보정하지 않는다. 대신 각 화음 그룹의 길이를
-   "다음 그룹이 시작하기 전까지"로 미리 잘라두기 때문에
-   커서가 뒤로 밀릴 일이 구조적으로 생기지 않는다.
+   박자 밀림을 막는 규칙 두 가지.
+
+   1) 커서는 "실제로 찍힌 길이"로만 전진한다.
+      ticksToMml이 돌려주는 tick이 요청 길이와 다를 수 있는데,
+      그 차이를 무시하면 트랙 전체가 조금씩 뒤로 밀린다.
+
+   2) 쉼표 길이는 항상 절대 위치에서 다시 계산한다.
+      앞에서 오차가 생겨도 다음 음에서 바로 흡수되므로 누적되지 않는다.
+
+   또 MIN_TICK(1/64음표)보다 가깝게 붙은 음은 하나의 화음으로 합친다.
+   예전 코드가 이런 음에 억지로 최소 길이를 주면서 커서를 앞질러
+   그 뒤 전체가 밀리던 문제를 여기서 없앤다.
    ============================================================ */
 function buildEvents(part, tempos, ppq) {
   const notes = part.notes.map(n => ({
@@ -366,15 +477,15 @@ function buildEvents(part, tempos, ppq) {
     pitch: keyToPitchClass(n.key),
     octave: keyToOctave(n.key),
     velocity: velocityToMml(n.velocity),
-    start: quantize(n.startTick, ppq),
-    duration: Math.max(0, quantize(n.endTick, ppq) - quantize(n.startTick, ppq))
+    start: snap(toTick(n.startTick, ppq)),
+    end:   snap(toTick(n.endTick, ppq))
   })).sort((a, b) => (a.start - b.start) || (a.key - b.key));
 
-  // 같은 시작점 = 한 화음
+  // 같은 시작점(또는 1/64음표보다 가까운 시작점) = 한 화음
   const groups = [];
   for (const n of notes) {
     const last = groups[groups.length - 1];
-    if (last && last.start === n.start) {
+    if (last && n.start - last.start < MIN_TICK) {
       if (!last.notes.some(x => x.key === n.key)) last.notes.push(n);  // 같은 음 중복 제거
     } else {
       groups.push({ start: n.start, notes: [n] });
@@ -383,15 +494,15 @@ function buildEvents(part, tempos, ppq) {
 
   // 그룹 길이 결정 + 다음 그룹 시작점까지로 클램프
   groups.forEach((g, idx) => {
-    const durations = g.notes.map(n => n.duration);
+    const durations = g.notes.map(n => Math.max(0, n.end - g.start));
     let dur;
     if (CHORD_DURATION_MODE === "max") dur = Math.max(...durations);
     else if (CHORD_DURATION_MODE === "first") dur = durations[0];
     else dur = Math.min(...durations);
 
     const next = groups[idx + 1];
-    if (next) dur = Math.min(dur, next.start - g.start);
-    g.duration = Math.max(1, dur);
+    if (next) dur = Math.min(dur, next.start - g.start);   // 그룹 간격은 항상 MIN_TICK 이상
+    g.duration = Math.max(MIN_TICK, dur);
   });
 
   // 템포 + 화음을 한 타임라인으로
@@ -404,9 +515,13 @@ function buildEvents(part, tempos, ppq) {
   let cursor = 0, lastOctave = null, lastVelocity = null, lastTempo = null;
 
   for (const item of timeline) {
+    // 절대 위치 기준으로 쉼표를 채운다. 앞선 오차는 여기서 흡수된다.
     if (item.pos > cursor) {
-      events.push({ type: "Rest", units: item.pos - cursor });
-      cursor = item.pos;
+      const rest = ticksToMml(REST, item.pos - cursor, false);   // 쉼표는 &로 잇지 않는다
+      if (rest.tick > 0) {
+        events.push({ type: "Rest", tick: rest.tick, text: rest.text });
+        cursor += rest.tick;
+      }
     }
 
     if (item.group === undefined) {
@@ -426,16 +541,20 @@ function buildEvents(part, tempos, ppq) {
       lastVelocity = vel;
     }
 
+    // 화음 구성음은 모두 같은 문자열 길이를 쓰므로 한 번만 계산한다
+    let played = 0;
     g.notes.forEach((n, idx) => {
       if (idx > 0) events.push({ type: "ConnectChord" });
       if (n.octave !== lastOctave) {
         events.push({ type: "Octave", value: n.octave });
         lastOctave = n.octave;
       }
-      events.push({ type: "Note", pitch: n.pitch, units: g.duration });
+      const note = ticksToMml(n.pitch, g.duration, true);
+      played = note.tick;                       // 실제로 찍힌 길이
+      events.push({ type: "Note", tick: note.tick, text: note.text });
     });
 
-    cursor += g.duration;
+    cursor += played;   // 요청 길이가 아니라 찍힌 길이로 전진
   }
 
   return events;
@@ -447,8 +566,8 @@ function eventToMml(e) {
     case "Tempo":        return "t" + e.tempo;
     case "Octave":       return "o" + e.value;
     case "Velocity":     return "v" + e.value;
-    case "Rest":         return lengthToMml(e.units, REST);
-    case "Note":         return lengthToMml(e.units, e.pitch);
+    case "Rest":         return e.text;
+    case "Note":         return e.text;
     default:             return "";
   }
 }
@@ -487,7 +606,18 @@ function convert(buffer) {
     }
   }
 
-  for (const t of tracks) t.mml = t.events.map(eventToMml).join("");
+  for (const t of tracks) {
+    t.mml = t.events.map(eventToMml).join("");
+    // 화음 구성음은 시간이 겹치므로 한 번만 센다
+    let total = 0, inChord = false;
+    for (const e of t.events) {
+      if (e.type === "ConnectChord") { inChord = true; continue; }
+      if (e.type === "Note") { if (!inChord) total += e.tick; continue; }
+      if (e.type === "Rest") { total += e.tick; }
+      inChord = false;
+    }
+    t.totalTick = total;
+  }
   return { ppq: smf.ppq, format: smf.format, tracks, tempoList };
 }
 
@@ -495,63 +625,68 @@ function convert(buffer) {
 const $ = s => document.querySelector(s);
 const fileEl = $("#file"), tracksEl = $("#tracks"), ppqEl = $("#ppq");
 const loadingEl = $("#loading"), errEl = $("#err"), warnEl = $("#warning");
-let currentSong = null;
+const quantizeEl = $("#quantize");
+let currentSong = null, currentBuffer = null;
 
-fileEl.addEventListener("change", async ev => {
-  errEl.textContent = ""; warnEl.textContent = ""; ppqEl.textContent = "";
-  tracksEl.innerHTML = ""; currentSong = null;
+function render(song) {
+  ppqEl.textContent = `PPQ ${song.ppq} · format ${song.format} · 트랙 ${song.tracks.length}개`;
+
+  const notes = [];
+  if (QUANTIZE_MODE === "binary") {
+    notes.push("2분할 격자(1/32)로만 맞춥니다. 셋잇단음표는 어긋납니다.");
+  } else if (QUANTIZE_MODE === "none") {
+    notes.push("양자화를 끈 상태입니다. 원본 연주의 흔들림이 그대로 남습니다.");
+  } else {
+    notes.push("1/32음표와 16분 셋잇단 중 가까운 쪽으로 맞춥니다.");
+  }
+  notes.push(`내부 해상도 ${TPQN} tick/4분음표 · 최소 단위 1/${WHOLE / MIN_TICK}음표`);
+  warnEl.textContent = notes.join("\n");
+
+  if (!song.tracks.length) {
+    tracksEl.innerHTML = '<p class="empty">음표가 있는 트랙을 찾지 못했습니다.</p>';
+    return;
+  }
+
+  tracksEl.innerHTML = "";
+  for (const t of song.tracks) {
+    const card = document.createElement("div"); card.className = "track";
+    const row = document.createElement("div"); row.className = "row";
+
+    const left = document.createElement("div");
+    const badge = document.createElement("span"); badge.className = "badge";
+    badge.textContent = `${t.label} · ${t.instrument}`;
+    const meta = document.createElement("span"); meta.className = "meta";
+    const bars = (t.totalTick / WHOLE).toFixed(1);
+    meta.textContent = `음표 ${t.noteCount}개, ${t.mml.length}자, 약 ${bars}마디`;
+    left.append(badge, meta);
+
+    const copy = document.createElement("button"); copy.className = "copy"; copy.textContent = "복사";
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(t.mml);
+        copy.textContent = "복사함";
+      } catch { copy.textContent = "복사 실패"; }
+      setTimeout(() => { copy.textContent = "복사"; }, 1200);
+    };
+
+    row.append(left, copy);
+
+    const ta = document.createElement("textarea");
+    ta.value = t.mml; ta.spellcheck = false;
+    ta.setAttribute("aria-label", t.label + " MML");
+
+    card.append(row, ta);
+    tracksEl.appendChild(card);
+  }
+}
+
+function run() {
+  errEl.textContent = ""; warnEl.textContent = "";
+  if (!currentBuffer) return;
   loadingEl.style.display = "inline";
-
   try {
-    const file = ev.target.files && ev.target.files[0];
-    if (!file) { tracksEl.innerHTML = '<p class="empty">아직 변환한 파일이 없습니다.</p>'; return; }
-
-    const song = convert(await file.arrayBuffer());
-    currentSong = song;
-
-    ppqEl.textContent = `PPQ ${song.ppq} · format ${song.format} · 트랙 ${song.tracks.length}개`;
-
-    const notes = [];
-    if (!Number.isInteger(tickPerUnit(song.ppq))) {
-      notes.push(`PPQ ${song.ppq}에서는 1/${RESOLUTION} 단위가 정수 tick으로 떨어지지 않습니다. 가장 가까운 자리로 맞춥니다.`);
-    }
-    notes.push(`셋잇단음표와 스윙은 1/${RESOLUTION} 격자로 반올림됩니다.`);
-    warnEl.textContent = notes.join("\n");
-
-    if (!song.tracks.length) {
-      tracksEl.innerHTML = '<p class="empty">음표가 있는 트랙을 찾지 못했습니다.</p>';
-      return;
-    }
-
-    for (const t of song.tracks) {
-      const card = document.createElement("div"); card.className = "track";
-      const row = document.createElement("div"); row.className = "row";
-
-      const left = document.createElement("div");
-      const badge = document.createElement("span"); badge.className = "badge";
-      badge.textContent = `${t.label} · ${t.instrument}`;
-      const meta = document.createElement("span"); meta.className = "meta";
-      meta.textContent = `음표 ${t.noteCount}개, ${t.mml.length}자`;
-      left.append(badge, meta);
-
-      const copy = document.createElement("button"); copy.className = "copy"; copy.textContent = "복사";
-      copy.onclick = async () => {
-        try {
-          await navigator.clipboard.writeText(t.mml);
-          copy.textContent = "복사함";
-        } catch { copy.textContent = "복사 실패"; }
-        setTimeout(() => { copy.textContent = "복사"; }, 1200);
-      };
-
-      row.append(left, copy);
-
-      const ta = document.createElement("textarea");
-      ta.value = t.mml; ta.spellcheck = false;
-      ta.setAttribute("aria-label", t.label + " MML");
-
-      card.append(row, ta);
-      tracksEl.appendChild(card);
-    }
+    currentSong = convert(currentBuffer);
+    render(currentSong);
   } catch (e) {
     console.error(e);
     errEl.textContent = e.message || String(e);
@@ -559,6 +694,27 @@ fileEl.addEventListener("change", async ev => {
   } finally {
     loadingEl.style.display = "none";
   }
+}
+
+fileEl.addEventListener("change", async ev => {
+  errEl.textContent = ""; warnEl.textContent = ""; ppqEl.textContent = "";
+  tracksEl.innerHTML = ""; currentSong = null; currentBuffer = null;
+
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) { tracksEl.innerHTML = '<p class="empty">아직 변환한 파일이 없습니다.</p>'; return; }
+
+  try {
+    currentBuffer = await file.arrayBuffer();
+  } catch (e) {
+    errEl.textContent = "파일을 읽지 못했습니다.";
+    return;
+  }
+  run();
+});
+
+quantizeEl.addEventListener("change", () => {
+  QUANTIZE_MODE = quantizeEl.value;
+  run();
 });
 
 function allText() {
