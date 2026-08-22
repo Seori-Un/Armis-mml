@@ -28,7 +28,11 @@
     border-bottom:1px dashed var(--line);padding-bottom:8px;margin-bottom:8px}
   .badge{display:inline-flex;gap:8px;align-items:center;background:var(--chip);
     border-radius:999px;padding:4px 10px;color:var(--accent);font-size:12px}
-  .meta{color:var(--muted);font-size:12px;margin-left:8px}
+  .meta{color:var(--muted);font-size:12px}
+  .left{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .arrow{color:var(--muted);font-size:12px}
+  select.inst{padding:4px 8px;border-radius:8px;border:1px solid var(--line);
+    background:#0f1420;color:var(--text);font-size:12px}
   textarea{width:100%;min-height:140px;resize:vertical;background:#0c111c;color:var(--text);
     border:1px solid var(--line);border-radius:8px;padding:10px;
     font-family:ui-monospace,Consolas,Menlo,monospace;font-size:13px;line-height:1.5}
@@ -124,8 +128,9 @@ const TRIPLET_GRID = WHOLE / 24;   // 16 tick = 1/24음표(16분 셋잇단)
    "first": 가장 낮은 음의 길이 사용 */
 const CHORD_DURATION_MODE = "min";
 
-/* 음량. Armis의 v 값은 1~15다. (0은 소리가 나지 않으므로 쓰지 않는다) */
-const VEL_MIN = 1;
+/* 음량. Armis의 v는 6 미만이면 소리가 나지 않으므로 6~15만 쓴다.
+   MIDI velocity 1~127을 이 구간에 그대로 펼쳐 대응시킨다. */
+const VEL_MIN = 6;
 const VEL_MAX = 15;
 const AUTO_BOOT_VELOCITY = true;   // 곡 전체 최대 velocity를 15로 끌어올림
 const INITIAL_TEMPO = 120;
@@ -172,6 +177,10 @@ const INSTRUMENT_MAP = ["acoustic grand piano","bright acoustic piano","electric
 
 const PITCH_CLASS = ["c","c+","d","d+","e","f","f+","g","g+","a","a+","b"];
 const REST = "r";
+
+/* 게임에서 고를 수 있는 악기.
+   지금은 화면에서 고르기만 하고 변환 결과에는 반영하지 않는다. */
+const ARMIS_INSTRUMENTS = ["피아노","북","고쟁","퉁소","바이올린","기타","비파","이호","피리","드럼","베이스","신디사이저","태평소"];
 
 /* ============================================================
    tick 테이블 (모듈 로드 시 1회 생성)
@@ -748,13 +757,30 @@ function render(song) {
     const card = document.createElement("div"); card.className = "track";
     const row = document.createElement("div"); row.className = "row";
 
-    const left = document.createElement("div");
+    const left = document.createElement("div"); left.className = "left";
+
+    // MIDI에 적힌 악기
     const badge = document.createElement("span"); badge.className = "badge";
     badge.textContent = t.label + " · " + t.instrument;
+
+    // 게임에서 쓸 악기 (선택만 하고 아직 변환에는 쓰지 않는다)
+    const arrow = document.createElement("span"); arrow.className = "arrow";
+    arrow.textContent = "→";
+    const pick = document.createElement("select"); pick.className = "inst";
+    pick.setAttribute("aria-label", t.label + " 악기 선택");
+    for (const name of ARMIS_INSTRUMENTS) {
+      const op = document.createElement("option");
+      op.value = name; op.textContent = name;
+      pick.appendChild(op);
+    }
+    if (!t.armis) t.armis = ARMIS_INSTRUMENTS[0];
+    pick.value = t.armis;
+    pick.onchange = () => { t.armis = pick.value; };
+
     const meta = document.createElement("span"); meta.className = "meta";
     const bars = (t.totalTick / WHOLE).toFixed(1);
     meta.textContent = "음표 " + t.noteCount + "개, " + t.mml.length + "자, 약 " + bars + "마디";
-    left.append(badge, meta);
+    left.append(badge, arrow, pick, meta);
 
     const copy = document.createElement("button"); copy.className = "copy"; copy.textContent = "복사";
     copy.onclick = async () => {
