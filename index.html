@@ -62,6 +62,9 @@
           <option value="none">끄기 (원본 그대로)</option>
         </select>
       </label>
+      <label class="opt">
+        <input id="technique" type="checkbox" checked /> 기법 자동 적용
+      </label>
       <span id="ppq" class="hint"></span>
       <span id="loading" class="loading">변환 중…</span>
     </div>
@@ -121,10 +124,41 @@ const TRIPLET_GRID = WHOLE / 24;   // 16 tick = 1/24음표(16분 셋잇단)
    "first": 가장 낮은 음의 길이 사용 */
 const CHORD_DURATION_MODE = "min";
 
-const VEL_MIN = 0;
+/* 음량. Armis의 v 값은 1~15다. (0은 소리가 나지 않으므로 쓰지 않는다) */
+const VEL_MIN = 1;
 const VEL_MAX = 15;
 const AUTO_BOOT_VELOCITY = true;   // 곡 전체 최대 velocity를 15로 끌어올림
 const INITIAL_TEMPO = 120;
+
+/* ============================================================
+   연주 기법
+   ============================================================
+   Armis 표기법
+     *N  → 음표 "뒤"에 붙는다.  예) c4*13
+     [N] → 음표 "앞"에 붙는다.  예) [1]c4
+   ============================================================ */
+const TECHNIQUE = {
+  up:       { code: "*8",  place: "post", label: "상" },
+  down:     { code: "*9",  place: "post", label: "하" },
+  staccato: { code: "*13", place: "post", label: "스타카토" },
+  accent:   { code: "*14", place: "post", label: "악센트" },
+  vibrato:  { code: "[1]", place: "pre",  label: "비브라토" },
+  fermata:  { code: "[2]", place: "pre",  label: "페르마타" }
+};
+
+/* MIDI에서 자동으로 뽑아낼 수 있는 기법만 켠다.
+   상/하, 페르마타는 MIDI 데이터만으로 판단할 근거가 없어 자동 적용하지 않는다. */
+let AUTO_TECHNIQUE = true;
+
+/* 스타카토: 실제 발음 길이가 그 자리(다음 음까지의 간격)의 이 비율 이하일 때 */
+const STACCATO_RATIO = 0.55;
+
+/* 악센트: 주변 음들의 평균 음량보다 이만큼(v 단위) 큰 음 */
+const ACCENT_DELTA = 3;
+const ACCENT_WINDOW = 8;   // 평균을 낼 앞뒤 음 개수
+
+/* 비브라토: 모듈레이션(CC1)이 이 값 이상으로 걸린 구간의 음 */
+const VIBRATO_CC_MIN = 40;
 
 /* ============================================================
    악기 맵 (General MIDI)
@@ -360,7 +394,11 @@ function parseSMF(buffer) {
       } else if (hi === 0xC0) {
         if (pos + 1 > d.length) break;
         events.push({ tick, type: "program", ch, program: d[pos++] });
-      } else if (hi === 0xA0 || hi === 0xB0 || hi === 0xE0) {
+      } else if (hi === 0xB0) {
+        if (pos + 2 > d.length) break;
+        const cc = d[pos++], value = d[pos++];
+        if (cc === 1) events.push({ tick, type: "mod", ch, value });   // 비브라토 판정용
+      } else if (hi === 0xA0 || hi === 0xE0) {
         pos += 2;
       } else if (hi === 0xD0) {
         pos += 1;
@@ -386,7 +424,7 @@ function collectParts(smf) {
     const partOf = (ch) => {
       const id = trackIndex + ":" + ch;
       if (!parts.has(id)) {
-        parts.set(id, { id, trackIndex, channel: ch, program: null, notes: [] });
+        parts.set(id, { id, trackIndex, channel: ch, program: null, notes: [], mods: [] });
       }
       return parts.get(id);
     };
@@ -411,6 +449,7 @@ function collectParts(smf) {
       endTick = Math.max(endTick, ev.tick);
       if (ev.type === "tempo") { tempos.push({ tick: ev.tick, bpm: ev.bpm }); continue; }
       if (ev.type === "program") { const p = partOf(ev.ch); if (p.program === null) p.program = ev.program; continue; }
+      if (ev.type === "mod") { partOf(ev.ch).mods.push({ tick: ev.tick, value: ev.value }); continue; }
       if (ev.type === "on")  { openNote(ev.ch, ev.key, ev.vel, ev.tick); continue; }
       if (ev.type === "off") { closeNote(ev.ch, ev.key, ev.tick); continue; }
     }
@@ -501,9 +540,43 @@ function buildEvents(part, tempos, ppq) {
     else dur = Math.min(...durations);
 
     const next = groups[idx + 1];
-    if (next) dur = Math.min(dur, next.start - g.start);   // 그룹 간격은 항상 MIN_TICK 이상
-    g.duration = Math.max(MIN_TICK, dur);
+    const slot = next ? next.start - g.start : dur;   // 그룹 간격은 항상 MIN_TICK 이상
+    g.techniques = [];
+
+    /* 스타카토
+       "짧은 음 + 쉼표" 대신 "자리를 다 채운 음 + *13"으로 적는다.
+       어느 쪽이든 다음 음이 시작하는 위치는 같으므로 박자는 그대로다. */
+    if (AUTO_TECHNIQUE && next && slot >= MIN_TICK * 2 && dur <= slot * STACCATO_RATIO) {
+      g.techniques.push(TECHNIQUE.staccato);
+      g.duration = slot;
+    } else {
+      g.duration = Math.max(MIN_TICK, Math.min(dur, slot));
+    }
   });
+
+  /* 악센트 — 주변 평균보다 뚜렷하게 센 음 */
+  if (AUTO_TECHNIQUE) {
+    const vel = groups.map(g => Math.max(...g.notes.map(n => n.velocity)));
+    groups.forEach((g, idx) => {
+      const from = Math.max(0, idx - ACCENT_WINDOW);
+      const to   = Math.min(vel.length, idx + ACCENT_WINDOW + 1);
+      let sum = 0, count = 0;
+      for (let i = from; i < to; i++) { if (i === idx) continue; sum += vel[i]; count++; }
+      if (count && vel[idx] >= sum / count + ACCENT_DELTA) g.techniques.push(TECHNIQUE.accent);
+    });
+  }
+
+  /* 비브라토 — 모듈레이션(CC1)이 걸려 있는 구간 */
+  if (AUTO_TECHNIQUE && part.mods && part.mods.length) {
+    const mods = part.mods
+      .map(m => ({ pos: snap(toTick(m.tick, ppq)), value: m.value }))
+      .sort((a, b) => a.pos - b.pos);
+    let mi = 0, current = 0;
+    for (const g of groups) {
+      while (mi < mods.length && mods[mi].pos <= g.start) current = mods[mi++].value;
+      if (current >= VIBRATO_CC_MIN) g.techniques.push(TECHNIQUE.vibrato);
+    }
+  }
 
   // 템포 + 화음을 한 타임라인으로
   const timeline = [
@@ -541,6 +614,10 @@ function buildEvents(part, tempos, ppq) {
       lastVelocity = vel;
     }
 
+    // 기법은 화음 전체에 한 번씩만 붙인다
+    const pre  = (g.techniques || []).filter(t => t.place === "pre").map(t => t.code).join("");
+    const post = (g.techniques || []).filter(t => t.place === "post").map(t => t.code).join("");
+
     // 화음 구성음은 모두 같은 문자열 길이를 쓰므로 한 번만 계산한다
     let played = 0;
     g.notes.forEach((n, idx) => {
@@ -549,10 +626,12 @@ function buildEvents(part, tempos, ppq) {
         events.push({ type: "Octave", value: n.octave });
         lastOctave = n.octave;
       }
+      if (idx === 0 && pre) events.push({ type: "Technique", text: pre });   // [N]은 음표 앞
       const note = ticksToMml(n.pitch, g.duration, true);
       played = note.tick;                       // 실제로 찍힌 길이
       events.push({ type: "Note", tick: note.tick, text: note.text });
     });
+    if (post) events.push({ type: "Technique", text: post });                // *N은 음표 뒤
 
     cursor += played;   // 요청 길이가 아니라 찍힌 길이로 전진
   }
@@ -566,6 +645,7 @@ function eventToMml(e) {
     case "Tempo":        return "t" + e.tempo;
     case "Octave":       return "o" + e.value;
     case "Velocity":     return "v" + e.value;
+    case "Technique":    return e.text;
     case "Rest":         return e.text;
     case "Note":         return e.text;
     default:             return "";
@@ -612,9 +692,8 @@ function convert(buffer) {
     let total = 0, inChord = false;
     for (const e of t.events) {
       if (e.type === "ConnectChord") { inChord = true; continue; }
-      if (e.type === "Note") { if (!inChord) total += e.tick; continue; }
-      if (e.type === "Rest") { total += e.tick; }
-      inChord = false;
+      if (e.type === "Note") { if (!inChord) total += e.tick; inChord = false; continue; }
+      if (e.type === "Rest") { total += e.tick; inChord = false; }
     }
     t.totalTick = total;
   }
@@ -625,7 +704,7 @@ function convert(buffer) {
 const $ = s => document.querySelector(s);
 const fileEl = $("#file"), tracksEl = $("#tracks"), ppqEl = $("#ppq");
 const loadingEl = $("#loading"), errEl = $("#err"), warnEl = $("#warning");
-const quantizeEl = $("#quantize");
+const quantizeEl = $("#quantize"), techniqueEl = $("#technique");
 let currentSong = null, currentBuffer = null;
 
 function render(song) {
@@ -639,7 +718,10 @@ function render(song) {
   } else {
     notes.push("1/32음표와 16분 셋잇단 중 가까운 쪽으로 맞춥니다.");
   }
-  notes.push(`내부 해상도 ${TPQN} tick/4분음표 · 최소 단위 1/${WHOLE / MIN_TICK}음표`);
+  notes.push(`내부 해상도 ${TPQN} tick/4분음표 · 최소 단위 1/${WHOLE / MIN_TICK}음표 · 음량 v${VEL_MIN}~v${VEL_MAX}`);
+  if (AUTO_TECHNIQUE) {
+    notes.push("자동 기법: 스타카토(*13), 악센트(*14), 비브라토([1], CC1 기준). 상/하/페르마타는 수동으로 넣어야 합니다.");
+  }
   warnEl.textContent = notes.join("\n");
 
   if (!song.tracks.length) {
@@ -714,6 +796,11 @@ fileEl.addEventListener("change", async ev => {
 
 quantizeEl.addEventListener("change", () => {
   QUANTIZE_MODE = quantizeEl.value;
+  run();
+});
+
+techniqueEl.addEventListener("change", () => {
+  AUTO_TECHNIQUE = techniqueEl.checked;
   run();
 });
 
