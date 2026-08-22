@@ -157,6 +157,11 @@ const STACCATO_RATIO = 0.55;
 const ACCENT_DELTA = 3;
 const ACCENT_WINDOW = 8;   // 평균을 낼 앞뒤 음 개수
 
+/* 악센트를 붙인 음의 v를 어떻게 할지.
+   "replace" : v를 주변 평균으로 되돌린다. 강조는 *14가 담당 (이중으로 커지지 않음)
+   "keep"    : 원래 v를 그대로 두고 *14도 붙인다 (아주 강한 강조) */
+const ACCENT_MODE = "replace";
+
 /* 비브라토: 모듈레이션(CC1)이 이 값 이상으로 걸린 구간의 음 */
 const VIBRATO_CC_MIN = 40;
 
@@ -554,7 +559,9 @@ function buildEvents(part, tempos, ppq) {
     }
   });
 
-  /* 악센트 — 주변 평균보다 뚜렷하게 센 음 */
+  /* 악센트 — 주변 평균보다 뚜렷하게 센 음.
+     *14가 강조를 담당하므로 v는 주변 수준으로 되돌린다.
+     그러지 않으면 v 상승과 악센트가 겹쳐 그 음만 튄다. */
   if (AUTO_TECHNIQUE) {
     const vel = groups.map(g => Math.max(...g.notes.map(n => n.velocity)));
     groups.forEach((g, idx) => {
@@ -562,7 +569,14 @@ function buildEvents(part, tempos, ppq) {
       const to   = Math.min(vel.length, idx + ACCENT_WINDOW + 1);
       let sum = 0, count = 0;
       for (let i = from; i < to; i++) { if (i === idx) continue; sum += vel[i]; count++; }
-      if (count && vel[idx] >= sum / count + ACCENT_DELTA) g.techniques.push(TECHNIQUE.accent);
+      if (!count) return;
+      const avg = sum / count;
+      if (vel[idx] >= avg + ACCENT_DELTA) {
+        g.techniques.push(TECHNIQUE.accent);
+        if (ACCENT_MODE === "replace") {
+          g.velocity = Math.max(VEL_MIN, Math.min(VEL_MAX, Math.round(avg)));
+        }
+      }
     });
   }
 
@@ -608,7 +622,7 @@ function buildEvents(part, tempos, ppq) {
 
     const g = item.group;
     // velocity는 화음 단위로 한 번만 (Armis 화음 안에는 o만 넣는다)
-    const vel = Math.max(...g.notes.map(n => n.velocity));
+    const vel = g.velocity !== undefined ? g.velocity : Math.max(...g.notes.map(n => n.velocity));
     if (vel !== lastVelocity) {
       events.push({ type: "Velocity", value: vel });
       lastVelocity = vel;
@@ -708,7 +722,7 @@ const quantizeEl = $("#quantize"), techniqueEl = $("#technique");
 let currentSong = null, currentBuffer = null;
 
 function render(song) {
-  ppqEl.textContent = `PPQ ${song.ppq} · format ${song.format} · 트랙 ${song.tracks.length}개`;
+  ppqEl.textContent = "PPQ " + song.ppq + " · format " + song.format + " · 트랙 " + song.tracks.length + "개";
 
   const notes = [];
   if (QUANTIZE_MODE === "binary") {
@@ -718,7 +732,7 @@ function render(song) {
   } else {
     notes.push("1/32음표와 16분 셋잇단 중 가까운 쪽으로 맞춥니다.");
   }
-  notes.push(`내부 해상도 ${TPQN} tick/4분음표 · 최소 단위 1/${WHOLE / MIN_TICK}음표 · 음량 v${VEL_MIN}~v${VEL_MAX}`);
+  notes.push("내부 해상도 " + TPQN + " tick/4분음표 · 최소 단위 1/" + (WHOLE / MIN_TICK) + "음표 · 음량 v" + VEL_MIN + "~v" + VEL_MAX);
   if (AUTO_TECHNIQUE) {
     notes.push("자동 기법: 스타카토(*13), 악센트(*14), 비브라토([1], CC1 기준). 상/하/페르마타는 수동으로 넣어야 합니다.");
   }
@@ -736,10 +750,10 @@ function render(song) {
 
     const left = document.createElement("div");
     const badge = document.createElement("span"); badge.className = "badge";
-    badge.textContent = `${t.label} · ${t.instrument}`;
+    badge.textContent = t.label + " · " + t.instrument;
     const meta = document.createElement("span"); meta.className = "meta";
     const bars = (t.totalTick / WHOLE).toFixed(1);
-    meta.textContent = `음표 ${t.noteCount}개, ${t.mml.length}자, 약 ${bars}마디`;
+    meta.textContent = "음표 " + t.noteCount + "개, " + t.mml.length + "자, 약 " + bars + "마디";
     left.append(badge, meta);
 
     const copy = document.createElement("button"); copy.className = "copy"; copy.textContent = "복사";
@@ -768,11 +782,19 @@ function run() {
   loadingEl.style.display = "inline";
   try {
     currentSong = convert(currentBuffer);
+  } catch (e) {
+    console.error(e);
+    errEl.textContent = "변환 실패: " + (e && e.message ? e.message : String(e));
+    tracksEl.innerHTML = '<p class="empty">변환하지 못했습니다.</p>';
+    loadingEl.style.display = "none";
+    return;
+  }
+  // 화면 표시가 실패해도 변환 결과 자체는 살려 둔다
+  try {
     render(currentSong);
   } catch (e) {
     console.error(e);
-    errEl.textContent = e.message || String(e);
-    tracksEl.innerHTML = '<p class="empty">변환하지 못했습니다.</p>';
+    errEl.textContent = "결과 표시 중 오류: " + (e && e.message ? e.message : String(e));
   } finally {
     loadingEl.style.display = "none";
   }
@@ -806,7 +828,9 @@ techniqueEl.addEventListener("change", () => {
 
 function allText() {
   if (!currentSong) return "";
-  return currentSong.tracks.map(t => `; ${t.label} — ${t.instrument}\n${t.mml}`).join("\n\n");
+  return currentSong.tracks.map(function (t) {
+    return "; " + t.label + " — " + t.instrument + "\n" + t.mml;
+  }).join("\n\n");
 }
 
 $("#copyAll").onclick = async () => {
