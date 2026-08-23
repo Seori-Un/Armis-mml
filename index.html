@@ -160,11 +160,13 @@ const INITIAL_TEMPO = 120;
      *9  graceDown 아래쪽 꾸밈음
      *10 doubleTongue 음이 두 번 울린다 (더블 텅잉)
      *11 tap       구멍을 한 번 막았다 푸는 소리 (타공음)
+     *12 nogi      "노기". 퉁소 전용. 날카로운 소리가 위에서 났다가 제 음으로 내려온다
      *13 staccato  짧게 끊어 연주
      *14 accent    강조
      *15 shoutMale   남성 추임새 (북)
      *16 shoutFemale 여성 추임새 (북)
      *17 flutter   지지직거릴 만큼 빠른 반복 (플러터 텅잉)
+     *18 bowTremolo 지지직거리는 빠른 반복. 이호에는 *1이 없어서 이것이 트레몰로 역할이다
      *19 timbre    음색이 바뀐다. 바이올린에서는 나팔 비슷한 소리가 난다
      *20 mute      소리가 아주 작아진다 (데드 노트)
      *21 pullOff   튕기는 소리. *22보다 세다
@@ -173,7 +175,7 @@ const INITIAL_TEMPO = 120;
      [2] fermata   늘임표
      [3] legato    바이올린. 감싼 구간을 이어서 연주
      [3] glissando 태평소·피리. 같은 번호인데 효과가 다르다
-     [4] spiccato  바이올린에서 스타카토 역할을 한다
+     [4] spiccato  바이올린·이호에서 스타카토 역할을 한다. 두 악기 효과가 같다
 
    *N은 악기가 달라도 번호와 효과가 같다. 대괄호는 그렇지 않아서
    [3]이 바이올린에서는 레가토, 태평소·피리에서는 글리산도다.
@@ -206,9 +208,9 @@ const TECHNIQUE_SETS = {
   "기타":       { vibrato:"*2", harmonic:"*5", staccato:"*7", graceUp:"*8", graceDown:"*9", accent:"*14", timbre:"*19", mute:"*20" },
   "북":         { shoutMale:"*15", shoutFemale:"*16" },
   "드럼":       { accent:"*14" },
-  "퉁소":       {},
-  "비파":       {},
-  "이호":       {},
+  "퉁소":       { vibrato:"*2", graceUp:"*8", graceDown:"*9", doubleTongue:"*10", tap:"*11", nogi:"*12", accent:"*14", timbre:"*19", glissando:"[3]" },
+  "비파":       { tremolo:"*1", vibrato:"*2", bendUp:"*3", bendDown:"*4", harmonic:"*5", cluster:"*6", graceUp:"*8", graceDown:"*9", accent:"*14" },
+  "이호":       { vibrato:"*2", bendUp:"*3", bendDown:"*4", harmonic:"*5", graceUp:"*8", graceDown:"*9", tap:"*11", accent:"*14", bowTremolo:"*18", timbre:"*19", staccato:"[4]" },
   "신디사이저": {}
 };
 
@@ -267,6 +269,83 @@ const REST = "r";
 /* 게임에서 고를 수 있는 악기.
    지금은 화면에서 고르기만 하고 변환 결과에는 반영하지 않는다. */
 const ARMIS_INSTRUMENTS = ["피아노","북","고쟁","퉁소","바이올린","기타","비파","이호","피리","드럼","베이스","신디사이저","태평소"];
+
+/* ============================================================
+   타악기 건반 대응표 (General MIDI 타악기 → 아르미스 건반)
+   ============================================================
+   북·드럼은 음정 악기가 아니라 건반마다 다른 타격음이 들어 있다.
+   MIDI 드럼 트랙의 음정은 GM 규격 번호(35=킥, 38=스네어 …)이므로
+   그대로 옮기면 엉뚱한 소리가 난다. 그래서 번호를 갈아끼운다.
+
+   값은 MIDI 키 번호다. o4c = 60 기준.
+   아르미스 쪽 소리가 GM보다 적어서 여러 개가 하나로 합쳐지는 건 어쩔 수 없다.
+   (탐 6종 → 3종, 심벌 4종 → 2종 등)
+   ============================================================ */
+const DRUM_KEYS = {                     // 드럼: o4c~o5e
+  킥:60, 스네어:61, 탐1:62, 탐2:63, 탐3:64,
+  하이햇닫음:65, 하이햇열림:66, 크래시1:67, 크래시2:68,
+  라이드:69, 서스펜디드:70, 카우벨:71,
+  목탁:72, 핸드벨:73, 스틱:74, 마라카스:75, 트라이앵글:76
+};
+
+const BUK_KEYS = {                      // 북: o1 추임새, o4~o6 세 벌, o7 젬베
+  클랩:33, 스냅:34,
+  북면4:60, 북채4:61, 북통4:62,
+  북면5:72, 북채5:73, 북통5:74,
+  북면6:84, 북채6:85, 북통6:86,
+  젬베저음:96, 젬베고음:97, 젬베중음:98
+};
+
+const PERCUSSION_MAPS = {
+  "드럼": {
+    fallback: DRUM_KEYS.탐1,
+    map: {
+      35:DRUM_KEYS.킥, 36:DRUM_KEYS.킥,
+      37:DRUM_KEYS.스틱, 38:DRUM_KEYS.스네어, 39:DRUM_KEYS.스네어, 40:DRUM_KEYS.스네어,
+      41:DRUM_KEYS.탐1, 43:DRUM_KEYS.탐1, 45:DRUM_KEYS.탐1,
+      47:DRUM_KEYS.탐2, 48:DRUM_KEYS.탐2,
+      50:DRUM_KEYS.탐3,
+      42:DRUM_KEYS.하이햇닫음, 44:DRUM_KEYS.하이햇닫음, 46:DRUM_KEYS.하이햇열림,
+      49:DRUM_KEYS.크래시1, 52:DRUM_KEYS.크래시2, 55:DRUM_KEYS.크래시2, 57:DRUM_KEYS.크래시2,
+      51:DRUM_KEYS.라이드, 53:DRUM_KEYS.라이드, 59:DRUM_KEYS.라이드,
+      54:DRUM_KEYS.마라카스, 56:DRUM_KEYS.카우벨, 58:DRUM_KEYS.마라카스,
+      60:DRUM_KEYS.탐3, 61:DRUM_KEYS.탐2, 62:DRUM_KEYS.탐3, 63:DRUM_KEYS.탐2, 64:DRUM_KEYS.탐1,
+      65:DRUM_KEYS.탐2, 66:DRUM_KEYS.탐1, 67:DRUM_KEYS.카우벨, 68:DRUM_KEYS.카우벨,
+      69:DRUM_KEYS.마라카스, 70:DRUM_KEYS.마라카스, 71:DRUM_KEYS.트라이앵글, 72:DRUM_KEYS.트라이앵글,
+      73:DRUM_KEYS.마라카스, 74:DRUM_KEYS.마라카스, 75:DRUM_KEYS.스틱,
+      76:DRUM_KEYS.목탁, 77:DRUM_KEYS.목탁,
+      78:DRUM_KEYS.마라카스, 79:DRUM_KEYS.마라카스,
+      80:DRUM_KEYS.트라이앵글, 81:DRUM_KEYS.트라이앵글, 82:DRUM_KEYS.마라카스
+    }
+  },
+  "북": {
+    fallback: BUK_KEYS.북면4,
+    map: {
+      35:BUK_KEYS.북통6, 36:BUK_KEYS.북통6,           // 킥 → 가장 낮은 울림
+      37:BUK_KEYS.북채4, 38:BUK_KEYS.북면4, 40:BUK_KEYS.북면4,
+      39:BUK_KEYS.클랩,
+      41:BUK_KEYS.북통5, 43:BUK_KEYS.북통5, 45:BUK_KEYS.북통5,
+      47:BUK_KEYS.북면5, 48:BUK_KEYS.북면5, 50:BUK_KEYS.북면5,
+      42:BUK_KEYS.북채5, 44:BUK_KEYS.북채5, 46:BUK_KEYS.북채6,
+      49:BUK_KEYS.북면6, 52:BUK_KEYS.북면6, 55:BUK_KEYS.북면6, 57:BUK_KEYS.북면6,
+      51:BUK_KEYS.북채6, 53:BUK_KEYS.북채6, 59:BUK_KEYS.북채6,
+      54:BUK_KEYS.스냅, 56:BUK_KEYS.북채4, 58:BUK_KEYS.스냅,
+      60:BUK_KEYS.젬베고음, 61:BUK_KEYS.젬베중음,
+      62:BUK_KEYS.젬베고음, 63:BUK_KEYS.젬베고음, 64:BUK_KEYS.젬베저음,
+      65:BUK_KEYS.북면5, 66:BUK_KEYS.북통5, 67:BUK_KEYS.북채4, 68:BUK_KEYS.북채4,
+      69:BUK_KEYS.스냅, 70:BUK_KEYS.스냅, 75:BUK_KEYS.북채4,
+      76:BUK_KEYS.북채4, 77:BUK_KEYS.북채4, 82:BUK_KEYS.스냅
+    }
+  }
+};
+
+/* 타악기면 GM 번호를 아르미스 건반으로 바꾼다. 음정 악기면 그대로 둔다. */
+function mapPercussion(key, instrument) {
+  const p = PERCUSSION_MAPS[instrument];
+  if (!p) return key;
+  const hit = p.map[key];
+  return hit === undefined ? p.fallback : hit;
+}
 
 /* ============================================================
    tick 테이블 (모듈 로드 시 1회 생성)
@@ -618,14 +697,17 @@ function buildEvents(part, tempos, ppq, instrument) {
   const graceDownTech= AUTO_TECHNIQUE ? techniqueOf(instrument, "graceDown") : null;
   const legatoTech   = AUTO_TECHNIQUE ? techniqueOf(instrument, "legato")    : null;
 
-  const notes = part.notes.map(n => ({
-    key: n.key,
-    pitch: keyToPitchClass(n.key),
-    octave: keyToOctave(n.key),
-    velocity: velocityToMml(n.velocity),
-    start: snap(toTick(n.startTick, ppq)),
-    end:   snap(toTick(n.endTick, ppq))
-  })).sort((a, b) => (a.start - b.start) || (a.key - b.key));
+  const notes = part.notes.map(n => {
+    const key = mapPercussion(n.key, instrument);   // 타악기는 건반을 갈아끼운다
+    return {
+      key,
+      pitch: keyToPitchClass(key),
+      octave: keyToOctave(key),
+      velocity: velocityToMml(n.velocity),
+      start: snap(toTick(n.startTick, ppq)),
+      end:   snap(toTick(n.endTick, ppq))
+    };
+  }).sort((a, b) => (a.start - b.start) || (a.key - b.key));
 
   // 같은 시작점(또는 1/64음표보다 가까운 시작점) = 한 화음
   let groups = [];
@@ -863,7 +945,7 @@ function convert(buffer) {
     part,                                   // 원본 노트를 들고 있어야 다시 변환할 수 있다
     label: "T" + part.trackIndex + " · ch" + part.channel,
     instrument: instrumentName(part),       // MIDI에 적힌 악기
-    armis: ARMIS_INSTRUMENTS[0],            // 게임에서 쓸 악기
+    armis: part.channel === 9 ? "드럼" : ARMIS_INSTRUMENTS[0],   // ch9는 GM 드럼 채널
     channel: part.channel,
     noteCount: part.notes.length
   }));
@@ -929,6 +1011,7 @@ function render(song) {
     notes.push("자동으로 붙는 것은 스타카토·악센트·비브라토(CC1 기준)·꾸밈음·레가토뿐이고, 그 악기에 없는 기법은 생략합니다.");
     notes.push("음색 전환(*19)처럼 MIDI에 근거가 없는 기법은 자동으로 넣지 않습니다.");
   }
+  notes.push("북·드럼을 고르면 GM 타악기 번호를 아르미스 건반으로 바꿉니다. MIDI 드럼 채널(ch9)은 드럼이 기본입니다.");
   warnEl.textContent = notes.join("\n");
 
   if (!song.tracks.length) {
