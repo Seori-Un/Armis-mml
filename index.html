@@ -261,7 +261,7 @@ const LEGATO_MIN_NOTES = 3;    // 이만큼 연속으로 이어져야 레가토�
 /* ============================================================
    악기 맵 (General MIDI)
    ============================================================ */
-const INSTRUMENT_MAP = ["acoustic grand piano","bright acoustic piano","electric grand piano","honky-tonk piano","electric piano 1","electric piano 2","harpsichord","clavi","celesta","glockenspiel","music box","vibraphone","marimba","xylophone","tubular bells","dulcimer","drawbar organ","percussive organ","rock organ","church organ","reed organ","accordion","harmonica","tango accordion","acoustic guitar (nylon)","acoustic guitar (steel)","electric guitar (jazz)","electric guitar (clean)","electric guitar (muted)","overdriven guitar","distortion guitar","guitar harmonics","acoustic bass","electric bass (finger)","electric bass (pick)","fretless bass","slap bass 1","slap bass 2","synth bass 1","synth bass 2","violin","viola","cello","contrabass","tremolo strings","pizzicato strings","orchestral harp","timpani","string ensemble 1","string ensemble 2","synthstrings 1","synthstrings 2","choir aahs","voice oohs","synth voice","orchestra hit","trumpet","trombone","tuba","muted trumpet","french horn","brass section","synthbrass 1","synthbrass 2","soprano sax","alto sax","tenor sax","baritone sax","oboe","english horn","bassoon","clarinet","piccolo","flute","recorder","pan flute","blown bottle","shakuhachi","whistle","ocarina","lead 1 (square)","lead 2 (sawtooth)","lead 3 (calliope)","lead 4 (chiff)","lead 5 (charang)","lead 6 (voice)","lead 7 (fifths)","lead 8 (bass + lead)","pad 1 (new age)","pad 2 (warm)","pad 3 (polysynth)","pad 4 (choir)","pad 5 (bowed)","pad 6 (metallic)","pad 7 (halo)","pad 8 (sweep)","fx 1 (rain)","fx 2 (soundtrack)","fx 3 (crystal)","fx 4 (atmosphere)","fx 5 (brightness)","fx 6 (goblins)","fx 7 (echoes)","fx 8 (sci-fi)","sitar","banjo","shamisen","koto","kalimba","bag pipe","fiddle","shanai","tinkle bell","agogo","steel drums","woodblock","taiko drum","melodic tom","synth drum","reverse cymbal","guitar fret noise","breath noise","seashore","bird tweet","telephone ring","helicopter","applause","gunshot"];
+const INSTRUMENT_MAP = ["acoustic grand piano","bright acoustic piano","electric grand piano","honky-tonk piano","electric piano 1","electric piano 2","harpsichord","clavi","celesta","glockenspiel","music box","vibraphone","marimba","xylophone","tubular bells","dulcimer","drawbar organ","percussive organ","rock organ","church organ","reed organ","accordion","harmonica","tango accordion","acoustic guitar (nylon)","acoustic guitar (steel)","electric guitar (jazz)","electric guitar (clean)","electric guitar (muted)","overdriven guitar","distortion guitar","guitar harmonics","acoustic bass","electric bass (finger)","electric bass (pick)","fretless bass","slap bass 1","slap bass 2","synth bass 1","synth bass 2","violin","viola","cello","contrabass","tremolo strings","pizzicato strings","orchestral harp","timpani","string ensemble 1","string ensemble 2","synthstrings 1","synthstrings 2","choir aahs","voice oohs","synth voice","orchestra hit","trumpet","trombone","tuba","muted trumpet","french horn","brass section","synthbrass 1","synthbrass 2","soprano sax","alto sax","tenor sax","baritone sax","oboe","english horn","bassoon","clarinet","piccolo","flute","recorder","pan flute","blown bottle","shakuhachi","whistle","ocarina","lead 1 (square)","lead 2 (sawtooth)","lead 3 (calliope)","lead 4 (chiff)","lead 5 (charang)","lead 6 (voice)","lead 7 (fifths)","lead 8 (bass + lead)","pad 1 (new age)","pad 2 (warm)","pad 3 (polysynth)","pad 4 (choir)","pad 5 (bowed)","pad 6 (metallic)","pad 7 (halo)","pad 8 (sweep)","fx 1 (비)","fx 2 (soundtrack)","fx 3 (crystal)","fx 4 (atmosphere)","fx 5 (brightness)","fx 6 (goblins)","fx 7 (echoes)","fx 8 (sci-fi)","sitar","banjo","shamisen","koto","kalimba","bag pipe","fiddle","shanai","tinkle bell","agogo","steel drums","woodblock","taiko drum","melodic tom","synth drum","reverse cymbal","guitar fret noise","breath noise","seashore","bird tweet","telephone ring","helicopter","applause","gunshot"];
 
 const PITCH_CLASS = ["c","c+","d","d+","e","f","f+","g","g+","a","a+","b"];
 const REST = "r";
@@ -412,12 +412,12 @@ function largestFitting(tick) {
   return best;
 }
 
-/* tick 길이 → MML 문자열.
+/* tick 길이 → 표현 가능한 토큰 목록 + 실제로 찍히는 tick.
    반환값의 tick은 "실제로 찍힌 길이"다. 요청 길이와 다를 수 있으므로
    커서 계산에는 반드시 이 값을 쓴다. (박자 밀림 방지의 핵심)
-   tie=false 이면 &로 잇지 않는다. 쉼표는 tie를 쓰면 안 되므로 false.
-   (MabiIcco MMLTicks의 needTie와 동일) */
-function ticksToMml(name, tick, tie) {
+   여기서는 요청 tick 중 MIN_TICK 미만으로 남는 "나머지"를 그냥 버린다.
+   이 나머지를 절대 잃어버리지 않게 만드는 건 createTickEmitter()의 역할이다. */
+function resolveTickTokens(tick) {
   let rem = Math.max(0, Math.round(tick));
   const out = [];
   let used = 0;
@@ -436,7 +436,40 @@ function ticksToMml(name, tick, tie) {
     rem -= fit;
   }
 
-  return { text: out.map(t => name + t).join(tie ? "&" : ""), tick: used };
+  return { tokens: out, tick: used };
+}
+
+function tokensToText(name, tokens, tie) {
+  return tokens.map(t => name + t).join(tie ? "&" : "");
+}
+
+/* 기존 호출부 호환용 얇은 래퍼. 내부적으로는 resolveTickTokens를 쓴다. */
+function ticksToMml(name, tick, tie) {
+  const { tokens, tick: used } = resolveTickTokens(tick);
+  return { text: tokensToText(name, tokens, tie), tick: used };
+}
+
+/* ============================================================
+   tick 오차 이월기 — "오차는 절대 무시하지 않는다"
+   ============================================================
+   MIN_TICK(6틱, 1/64음표)보다 작은 나머지는 어떤 토큰으로도 표현할 수 없다.
+   이걸 그냥 버리면 그 자리 하나는 몇 틱 짧게 나오는데, 문제는 그 뒤로도
+   계속 짧게 나온 만큼 밀린 채로 남는다는 것이다. (특히 템포가 겹치면
+   양자화 스냅으로 이 나머지가 훨씬 자주 발생한다.)
+
+   createTickEmitter()가 만드는 take()는 "요청 tick + 지난번에 못 채운 나머지"를
+   합쳐서 변환하고, 이번에도 못 채운 나머지를 다시 들고 있다가 바로 다음
+   호출에 얹는다. 개별 음/쉼표 하나의 실제 길이가 몇 tick 어긋날 수는 있지만
+   (최대 MIN_TICK-1 = 5틱, 약 26ms@120bpm), 트랙 전체로 합산하면 tick이
+   단 하나도 사라지지 않는다. (표준적인 Bresenham식 오차 이월) */
+function createTickEmitter() {
+  let carry = 0;
+  return function take(tick) {
+    const want = Math.max(0, tick) + carry;
+    const r = resolveTickTokens(want);
+    carry = want - r.tick;   // 항상 0 이상. 다음 호출로 그대로 넘어간다.
+    return r;
+  };
 }
 
 /* ============================================================
@@ -620,7 +653,7 @@ function collectParts(smf) {
       if (!stack || !stack.length) return;
       const note = stack.pop();          // 겹친 같은 음은 최근 것부터 닫는다
       note.endTick = Math.max(note.startTick, tick);
-      partOf(ch).notes.push(note);
+      partOf(ch).notes.push(음표);
       if (!stack.length) holding.delete(k);
     };
 
@@ -638,7 +671,7 @@ function collectParts(smf) {
       const ch = Number(k.split(":")[0]);
       for (const note of stack) {
         note.endTick = Math.max(note.startTick, endTick);
-        partOf(ch).notes.push(note);
+        partOf(ch).notes.push(음표);
       }
     }
   });
@@ -674,20 +707,105 @@ function normalizeTempos(raw, ppq) {
 }
 
 /* ============================================================
+   템포 경계 처리 — "화음은 절대 안 쪼갠다 / 단음은 정확히 쪼갠다"
+   ============================================================
+   음(또는 화음)의 발음 구간 "안쪽"에 템포 변경이 걸리는 경우를 처리한다.
+
+   - 화음(동시에 2음 이상): 쪼개지 않는다. 걸린 템포를 전부 화음 시작
+     지점으로 당겨서, 화음이 울리기 직전에 템포가 바뀌도록 한다.
+     (여러 개가 한 화음 안에 몰려 있으면 원래 순서대로 화음 시작 지점에
+     연달아 찍히고, 최종적으로는 마지막 값이 남는다.)
+
+   - 단음: 정확한 tick 위치에서 두 조각으로 쪼개고 그 사이에 템포를
+     끼워 넣는다. Armis에서 템포 사이에도 같은 음을 &로 이어붙일 수
+     있다는 전제 하에 동작한다 (c4&t140&c8 형태).
+
+   표현 가능한 최소 길이(MIN_TICK, 1/64음표)보다 짧은 조각이 생기는
+   경우에는 쪼개지 않고 가까운 경계(구간 시작 또는 끝) 쪽으로 흡수한다.
+   어떤 경우에도 템포 이벤트 자체를 버리지는 않는다 — 최대 MIN_TICK-1
+   틱(약 26ms@120bpm) 이내로 위치만 조정될 뿐이다. */
+function resolveTempoBoundaries(groups, tempos) {
+  const adjustedTempos = tempos.map(t => ({ ...t }));  // song 전체가 공유하는 배열은 건드리지 않는다
+  const outGroups = [];
+
+  for (const g of groups) {
+    const spanStart = g.start;
+    const spanEnd = g.start + g.duration;
+
+    const inside = adjustedTempos.filter(t => t.pos > spanStart && t.pos < spanEnd);
+    if (!inside.length) { outGroups.push(g); continue; }
+
+    if (g.notes.length > 1) {
+      // 화음: 절대 쪼개지 않는다. 화음 시작 지점으로 당긴다.
+      for (const t of inside) t.pos = spanStart;
+      outGroups.push(g);
+      continue;
+    }
+
+    // 단음: 표현 불가능한(MIN_TICK 미만) 조각이 생기지 않도록 경계로 흡수한다.
+    inside.sort((a, b) => a.pos - b.pos);
+    for (const t of inside) {
+      if (t.pos - spanStart < MIN_TICK) t.pos = spanStart;
+      else if (spanEnd - t.pos < MIN_TICK) t.pos = spanEnd;
+    }
+
+    // 흡수 후에도 정말 "구간 안쪽"에 남아 분할이 필요한 지점만 추린다.
+    let splitPoints = [...new Set(
+      inside.filter(t => t.pos > spanStart && t.pos < spanEnd).map(t => t.pos)
+    )].sort((a, b) => a - b);
+
+    // 서로 MIN_TICK보다 가까운 분할점은 더 나중 값(마지막 템포)만 남긴다.
+    const merged = [];
+    for (const pos of splitPoints) {
+      if (merged.length && pos - merged[merged.length - 1] < MIN_TICK) merged[merged.length - 1] = pos;
+      else merged.push(pos);
+    }
+    splitPoints = merged;
+
+    if (!splitPoints.length) { outGroups.push(g); continue; }
+
+    let pieceStart = spanStart;
+    const pieces = [];
+    for (const pos of splitPoints) {
+      pieces.push({ start: pieceStart, duration: pos - pieceStart });
+      pieceStart = pos;
+    }
+    pieces.push({ start: pieceStart, duration: spanEnd - pieceStart });
+
+    pieces.forEach((piece, idx) => {
+      const isFirst = idx === 0;
+      const isLast = idx === pieces.length - 1;
+      outGroups.push({
+        start: piece.start,
+        duration: piece.duration,
+        notes: g.notes,               // 같은 음이므로 그대로 공유
+        velocity: g.velocity,
+        // [N] 구간 기법은 쪼개진 조각 전체가 아니라 원래 음 전체를 감싸야 하므로
+        // 여는 태그는 첫 조각에만, 닫는 태그는 마지막 조각에만 남긴다.
+        open: isFirst ? g.open : undefined,
+        close: isLast ? g.close : undefined,
+        // *N 기법(스타카토 등)은 마지막으로 소리가 실제로 끊기는 조각에서만 의미가 있다.
+        techniques: isLast ? g.techniques : [],
+        staccato: isLast ? g.staccato : false,
+        tied: !isFirst                // 앞 조각과 &로 이어붙일 조각인지
+      });
+    });
+  }
+
+  return { groups: outGroups, tempos: adjustedTempos };
+}
+
+/* ============================================================
    MML 이벤트 생성
    ============================================================
-   박자 밀림을 막는 규칙 두 가지.
+   박자 밀림을 막는 규칙.
 
-   1) 커서는 "실제로 찍힌 길이"로만 전진한다.
-      ticksToMml이 돌려주는 tick이 요청 길이와 다를 수 있는데,
-      그 차이를 무시하면 트랙 전체가 조금씩 뒤로 밀린다.
-
-   2) 쉼표 길이는 항상 절대 위치에서 다시 계산한다.
-      앞에서 오차가 생겨도 다음 음에서 바로 흡수되므로 누적되지 않는다.
+   cursor는 "실제로 찍힌 tick"이 아니라 "원본 기준 절대 위치(목표치)"를
+   그대로 따라간다. 목표치와 실제 표현 가능한 tick 사이의 차이는
+   createTickEmitter()가 만드는 carry가 들고 다니다가 바로 다음 호출에
+   얹으므로, 트랙 전체로 보면 tick이 하나도 사라지지 않는다.
 
    또 MIN_TICK(1/64음표)보다 가깝게 붙은 음은 하나의 화음으로 합친다.
-   예전 코드가 이런 음에 억지로 최소 길이를 주면서 커서를 앞질러
-   그 뒤 전체가 밀리던 문제를 여기서 없앤다.
    ============================================================ */
 function buildEvents(part, tempos, ppq, instrument) {
   const staccatoTech = AUTO_TECHNIQUE ? techniqueOf(instrument, "staccato")  : null;
@@ -852,27 +970,35 @@ function buildEvents(part, tempos, ppq, instrument) {
     }
   }
 
+  // 화음 안쪽에 걸리는 템포는 화음 시작으로 당기고, 단음 안쪽에 걸리는 템포는
+  // 정확한 위치에서 음을 쪼개 그 사이에 끼워 넣는다. (화음은 쪼개지 않음)
+  const resolved = resolveTempoBoundaries(groups, tempos);
+  groups = resolved.groups;
+  const localTempos = resolved.tempos;
+
   // 템포 + 화음을 한 타임라인으로
   const timeline = [
-    ...tempos.map(t => ({ pos: t.pos, order: 0, tempo: t.bpm })),
+    ...localTempos.map(t => ({ pos: t.pos, order: 0, tempo: t.bpm })),
     ...groups.map(g => ({ pos: g.start, order: 1, group: g }))
   ].sort((a, b) => (a.pos - b.pos) || (a.order - b.order));
 
   const events = [];
+  const takeTicks = createTickEmitter();   // 이 트랙 전체가 하나의 carry를 공유한다
   let cursor = 0, lastOctave = null, lastVelocity = null, lastTempo = null;
 
   for (const item of timeline) {
-    // 절대 위치 기준으로 쉼표를 채운다. 앞선 오차는 여기서 흡수된다.
+    // 절대 위치 기준으로 쉼표를 채운다. cursor는 목표 위치로 정확히 맞추고,
+    // 실제 표현과의 차이는 takeTicks의 carry가 다음 호출로 그대로 넘긴다.
     if (item.pos > cursor) {
-      const rest = ticksToMml(REST, item.pos - cursor, false);   // 쉼표는 &로 잇지 않는다
-      if (rest.tick > 0) {
-        events.push({ type: "Rest", tick: rest.tick, text: rest.text });
-        cursor += rest.tick;
+      const needed = item.pos - cursor;
+      const rest = takeTicks(needed);   // 쉼표는 &로 잇지 않는다
+      if (rest.tokens.length) {
+        events.push({ type: "Rest", tick: rest.tick, text: tokensToText(REST, rest.tokens, false) });
       }
+      cursor = item.pos;
     }
 
     if (item.group === undefined) {
-      // 음표 중간에 걸린 템포는 가장 가까운 다음 경계로 밀린다
       if (item.tempo !== lastTempo) {
         events.push({ type: "Tempo", tempo: item.tempo });
         lastTempo = item.tempo;
@@ -893,8 +1019,12 @@ function buildEvents(part, tempos, ppq, instrument) {
     const post = (g.techniques || []).filter(t => t.place === "post").map(t => t.code).join("")
                + (g.close || []).slice().reverse().join("");   // 연 순서의 역순으로 닫는다
 
-    // 화음 구성음은 모두 같은 문자열 길이를 쓰므로 한 번만 계산한다
-    let played = 0;
+    // 템포 분할로 생긴 "이어지는 조각"은 앞 조각과 & 로 묶는다.
+    // (기법 문자 "&"가 아니라 순수 타이이므로 별도 이벤트 타입으로 낸다.)
+    if (g.tied) events.push({ type: "Tie" });
+
+    // 화음 구성음은 모두 같은 tick 길이를 쓰므로 토큰 계산은 한 번만 한다.
+    const noteTicks = takeTicks(g.duration);
     g.notes.forEach((n, idx) => {
       if (idx > 0) events.push({ type: "ConnectChord" });
       if (n.octave !== lastOctave) {
@@ -902,13 +1032,11 @@ function buildEvents(part, tempos, ppq, instrument) {
         lastOctave = n.octave;
       }
       if (idx === 0 && pre) events.push({ type: "Technique", text: pre });   // [N]은 음표 앞
-      const note = ticksToMml(n.pitch, g.duration, true);
-      played = note.tick;                       // 실제로 찍힌 길이
-      events.push({ type: "Note", tick: note.tick, text: note.text });
+      events.push({ type: "Note", tick: noteTicks.tick, text: tokensToText(n.pitch, noteTicks.tokens, true) });
     });
     if (post) events.push({ type: "Technique", text: post });                // *N은 음표 뒤
 
-    cursor += played;   // 요청 길이가 아니라 찍힌 길이로 전진
+    cursor += g.duration;   // 목표 길이만큼 전진. 실제 표현과의 오차는 carry로 이월된다.
   }
 
   return events;
@@ -921,8 +1049,9 @@ function eventToMml(e) {
     case "Octave":       return "o" + e.value;
     case "Velocity":     return "v" + e.value;
     case "Technique":    return e.text;
-    case "Rest":         return e.text;
-    case "Note":         return e.text;
+    case "Tie":           return "&";
+    case "Rest":          return e.text;
+    case "Note":           return e.text;
     default:             return "";
   }
 }
@@ -958,7 +1087,9 @@ function convert(buffer) {
 
 /* 트랙별 악기에 맞춰 MML을 다시 만든다.
    악기를 바꿨을 때 MIDI를 다시 읽을 필요 없이 이 함수만 부르면 된다.
-   음량 보정이 곡 전체를 보고 계산되므로 한 트랙만 바뀌어도 전부 다시 만든다. */
+   음량 보정이 곡 전체를 보고 계산되므로 한 트랙만 바뀌어도 전부 다시 만든다.
+   각 트랙은 song.tempoList 전체를 독립적으로 받아 자기 타임라인에 직접
+   삽입한다 — 마비꼬와 달리 Armis는 모든 트랙에 템포가 들어가야 한다. */
 function rebuild(song) {
   const tracks = song.tracks;
   for (const t of tracks) {
@@ -1006,12 +1137,15 @@ function render(song) {
     notes.push("1/32음표와 16분 셋잇단 중 가까운 쪽으로 맞춥니다.");
   }
   notes.push("내부 해상도 " + TPQN + " tick/4분음표 · 최소 단위 1/" + (WHOLE / MIN_TICK) + "음표 · 음량 v" + VEL_MIN + "~v" + VEL_MAX);
+  notes.push("음 중간에 템포가 걸리면: 화음은 쪼개지 않고 화음 시작 지점으로 템포를 당깁니다. 단음은 정확한 위치에서 &로 이어붙여 쪼갭니다.");
+  notes.push("표현 불가능한 나머지 tick은 버리지 않고 다음 음/쉼표로 이월합니다 — 트랙 전체 길이는 항상 정확히 맞습니다.");
   if (AUTO_TECHNIQUE) {
     notes.push("기법은 악기 전용입니다. 악기를 바꾸면 그 악기의 기법으로 다시 변환합니다.");
     notes.push("자동으로 붙는 것은 스타카토·악센트·비브라토(CC1 기준)·꾸밈음·레가토뿐이고, 그 악기에 없는 기법은 생략합니다.");
     notes.push("음색 전환(*19)처럼 MIDI에 근거가 없는 기법은 자동으로 넣지 않습니다.");
   }
   notes.push("북·드럼을 고르면 GM 타악기 번호를 아르미스 건반으로 바꿉니다. MIDI 드럼 채널(ch9)은 드럼이 기본입니다.");
+  notes.push("Armis는 마비꼬와 달리 모든 트랙에 템포를 출력합니다.");
   warnEl.textContent = notes.join("\n");
 
   if (!song.tracks.length) {
