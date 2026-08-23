@@ -261,7 +261,7 @@ const LEGATO_MIN_NOTES = 3;    // 이만큼 연속으로 이어져야 레가토�
 /* ============================================================
    악기 맵 (General MIDI)
    ============================================================ */
-const INSTRUMENT_MAP = ["acoustic grand piano","bright acoustic piano","electric grand piano","honky-tonk piano","electric piano 1","electric piano 2","harpsichord","clavi","celesta","glockenspiel","music box","vibraphone","marimba","xylophone","tubular bells","dulcimer","drawbar organ","percussive organ","rock organ","church organ","reed organ","accordion","harmonica","tango accordion","acoustic guitar (nylon)","acoustic guitar (steel)","electric guitar (jazz)","electric guitar (clean)","electric guitar (muted)","overdriven guitar","distortion guitar","guitar harmonics","acoustic bass","electric bass (finger)","electric bass (pick)","fretless bass","slap bass 1","slap bass 2","synth bass 1","synth bass 2","violin","viola","cello","contrabass","tremolo strings","pizzicato strings","orchestral harp","timpani","string ensemble 1","string ensemble 2","synthstrings 1","synthstrings 2","choir aahs","voice oohs","synth voice","orchestra hit","trumpet","trombone","tuba","muted trumpet","french horn","brass section","synthbrass 1","synthbrass 2","soprano sax","alto sax","tenor sax","baritone sax","oboe","english horn","bassoon","clarinet","piccolo","flute","recorder","pan flute","blown bottle","shakuhachi","whistle","ocarina","lead 1 (square)","lead 2 (sawtooth)","lead 3 (calliope)","lead 4 (chiff)","lead 5 (charang)","lead 6 (voice)","lead 7 (fifths)","lead 8 (bass + lead)","pad 1 (new age)","pad 2 (warm)","pad 3 (polysynth)","pad 4 (choir)","pad 5 (bowed)","pad 6 (metallic)","pad 7 (halo)","pad 8 (sweep)","fx 1 (비)","fx 2 (soundtrack)","fx 3 (crystal)","fx 4 (atmosphere)","fx 5 (brightness)","fx 6 (goblins)","fx 7 (echoes)","fx 8 (sci-fi)","sitar","banjo","shamisen","koto","kalimba","bag pipe","fiddle","shanai","tinkle bell","agogo","steel drums","woodblock","taiko drum","melodic tom","synth drum","reverse cymbal","guitar fret noise","breath noise","seashore","bird tweet","telephone ring","helicopter","applause","gunshot"];
+const INSTRUMENT_MAP = ["acoustic grand piano","bright acoustic piano","electric grand piano","honky-tonk piano","electric piano 1","electric piano 2","harpsichord","clavi","celesta","glockenspiel","music box","vibraphone","marimba","xylophone","tubular bells","dulcimer","drawbar organ","percussive organ","rock organ","church organ","reed organ","accordion","harmonica","tango accordion","acoustic guitar (nylon)","acoustic guitar (steel)","electric guitar (jazz)","electric guitar (clean)","electric guitar (muted)","overdriven guitar","distortion guitar","guitar harmonics","acoustic bass","electric bass (finger)","electric bass (pick)","fretless bass","slap bass 1","slap bass 2","synth bass 1","synth bass 2","violin","viola","cello","contrabass","tremolo strings","pizzicato strings","orchestral harp","timpani","string ensemble 1","string ensemble 2","synthstrings 1","synthstrings 2","choir aahs","voice oohs","synth voice","orchestra hit","trumpet","trombone","tuba","muted trumpet","french horn","brass section","synthbrass 1","synthbrass 2","soprano sax","alto sax","tenor sax","baritone sax","oboe","english horn","bassoon","clarinet","piccolo","flute","recorder","pan flute","blown bottle","shakuhachi","whistle","ocarina","lead 1 (square)","lead 2 (sawtooth)","lead 3 (calliope)","lead 4 (chiff)","lead 5 (charang)","lead 6 (voice)","lead 7 (fifths)","lead 8 (bass + lead)","pad 1 (new age)","pad 2 (warm)","pad 3 (polysynth)","pad 4 (choir)","pad 5 (bowed)","pad 6 (metallic)","pad 7 (halo)","pad 8 (sweep)","fx 1 (rain)","fx 2 (soundtrack)","fx 3 (crystal)","fx 4 (atmosphere)","fx 5 (brightness)","fx 6 (goblins)","fx 7 (echoes)","fx 8 (sci-fi)","sitar","banjo","shamisen","koto","kalimba","bag pipe","fiddle","shanai","tinkle bell","agogo","steel drums","woodblock","taiko drum","melodic tom","synth drum","reverse cymbal","guitar fret noise","breath noise","seashore","bird tweet","telephone ring","helicopter","applause","gunshot"];
 
 const PITCH_CLASS = ["c","c+","d","d+","e","f","f+","g","g+","a","a+","b"];
 const REST = "r";
@@ -345,6 +345,23 @@ function mapPercussion(key, instrument) {
   if (!p) return key;
   const hit = p.map[key];
   return hit === undefined ? p.fallback : hit;
+}
+
+/* 특정 건반만 음량을 깎는다.
+   드럼 하이햇은 음원 자체가 커서 다른 타격음과 균형이 안 맞는다.
+   매핑이 끝난 뒤의 건반 번호를 기준으로 하고, v 하한(VEL_MIN) 아래로는 안 내려간다. */
+const VELOCITY_TRIM = {
+  "드럼": {
+    [DRUM_KEYS.하이햇닫음]: -3,
+    [DRUM_KEYS.하이햇열림]: -3
+  }
+};
+
+function trimVelocity(v, key, instrument) {
+  const table = VELOCITY_TRIM[instrument];
+  const delta = table && table[key];
+  if (!delta) return v;
+  return Math.max(VEL_MIN, Math.min(VEL_MAX, v + delta));
 }
 
 /* ============================================================
@@ -653,7 +670,7 @@ function collectParts(smf) {
       if (!stack || !stack.length) return;
       const note = stack.pop();          // 겹친 같은 음은 최근 것부터 닫는다
       note.endTick = Math.max(note.startTick, tick);
-      partOf(ch).notes.push(음표);
+      partOf(ch).notes.push(note);
       if (!stack.length) holding.delete(k);
     };
 
@@ -671,7 +688,7 @@ function collectParts(smf) {
       const ch = Number(k.split(":")[0]);
       for (const note of stack) {
         note.endTick = Math.max(note.startTick, endTick);
-        partOf(ch).notes.push(음표);
+        partOf(ch).notes.push(note);
       }
     }
   });
@@ -787,7 +804,8 @@ function resolveTempoBoundaries(groups, tempos) {
         // *N 기법(스타카토 등)은 마지막으로 소리가 실제로 끊기는 조각에서만 의미가 있다.
         techniques: isLast ? g.techniques : [],
         staccato: isLast ? g.staccato : false,
-        tied: !isFirst                // 앞 조각과 &로 이어붙일 조각인지
+        tied: !isFirst,               // 앞 조각과 &로 이어붙일 조각인지
+        continues: !isLast            // 뒤에 템포로 쪼개진 조각이 더 있는지 (닫는 &가 필요)
       });
     });
   }
@@ -821,7 +839,7 @@ function buildEvents(part, tempos, ppq, instrument) {
       key,
       pitch: keyToPitchClass(key),
       octave: keyToOctave(key),
-      velocity: velocityToMml(n.velocity),
+      velocity: trimVelocity(velocityToMml(n.velocity), key, instrument),
       start: snap(toTick(n.startTick, ppq)),
       end:   snap(toTick(n.endTick, ppq))
     };
@@ -1035,6 +1053,10 @@ function buildEvents(part, tempos, ppq, instrument) {
       events.push({ type: "Note", tick: noteTicks.tick, text: tokensToText(n.pitch, noteTicks.tokens, true) });
     });
     if (post) events.push({ type: "Technique", text: post });                // *N은 음표 뒤
+
+    // 뒤에 템포로 쪼개진 조각이 더 있으면 여기서도 &로 닫는다.
+    // 템포 명령 양쪽에 &가 있어야 이어진 음으로 취급된다 (c4&t140&c8 형태).
+    if (g.continues) events.push({ type: "Tie" });
 
     cursor += g.duration;   // 목표 길이만큼 전진. 실제 표현과의 오차는 carry로 이월된다.
   }
