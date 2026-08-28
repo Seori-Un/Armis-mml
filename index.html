@@ -300,8 +300,8 @@ const VIBRATO_CC_MIN = 40;
    본음이 꾸밈음의 자리까지 넘겨받으므로 박자는 그대로다.
    조건을 좁게 잡지 않으면 빠른 멜로디가 통째로 꾸밈음으로 먹히니 주의. */
 const GRACE_MAX_INTERVAL = 2;        // 본음과 반음 2개 이내 (1~2도)
-const GRACE_MAX_TICK = WHOLE / 16;   // 꾸밈음 자리가 1/16음표 이하
-const GRACE_MAIN_RATIO = 2;          // 본음이 꾸밈음보다 이 배 이상 길어야 한다
+const GRACE_MAX_TICK = WHOLE / 32;   // 꾸밈음 자리가 1/32음표 이하
+const GRACE_MAIN_RATIO = 4;          // 본음이 꾸밈음보다 이 배 이상 길어야 한다
 
 /* 레가토([3] … [3])
    음이 자기 자리를 거의 다 채워서 다음 음까지 빈틈이 없는 구간을 감싼다.
@@ -896,8 +896,20 @@ function resolveTempoBoundaries(groups, tempos) {
     if (!inside.length) { outGroups.push(g); continue; }
 
     if (g.notes.length > 1) {
-      // 화음: 절대 쪼개지 않는다. 화음 시작 지점으로 당긴다.
-      for (const t of inside) t.pos = spanStart;
+      /* 화음은 타이로 쪼갤 수 없다. 예전에는 템포를 화음 시작으로 당겼는데,
+         화음이 놓인 자리가 트랙마다 다르다 보니 같은 템포가 트랙마다 다른
+         시각에 걸렸다. 한 번 어긋나면 그 뒤로 영영 어긋난 채로 간다.
+
+         그래서 템포를 옮기는 대신 화음을 템포 자리에서 끊는다.
+         화음이 조금 짧아질 뿐 템포는 제자리에 남고, 남은 자리는 쉼표가 된다.
+         쉼표는 얼마든지 쪼갤 수 있으므로 뒤따르는 템포도 제자리에 찍힌다. */
+      const cut = inside[0].pos - spanStart;
+      if (cut >= MIN_TICK) {
+        g.duration = cut;
+      } else {
+        // 끊어 봐야 표현할 수 없을 만큼 앞이면 그때만 화음 시작으로 당긴다
+        for (const t of inside) if (t.pos - spanStart < MIN_TICK) t.pos = spanStart;
+      }
       outGroups.push(g);
       continue;
     }
@@ -1013,9 +1025,16 @@ function makeGroups(part, instrument, ppq, techs) {
                                : Math.max(MIN_TICK, next.notes[0].end - next.start);
         const diff = g.notes[0].key - next.notes[0].key;
         const tech = diff > 0 ? techs.graceUp : techs.graceDown;
+        /* 진짜 꾸밈음은 "아주 짧게 스치고 본음이 길게 남는" 모양이다.
+           앞뒤가 비슷한 길이로 이어지면 그건 빠른 패시지의 멜로디이지
+           꾸밈음이 아니다. 그걸 흡수해 버리면 음이 통째로 사라지고
+           뒤 음까지 앞으로 당겨져 선율이 망가진다.
+           그래서 앞 음도 짧아야 하고(prevSlot), 본음이 확실히 길어야 한다. */
+        const prevSlot = i > 0 ? g.start - groups[i - 1].start : Infinity;
         if (tech && diff !== 0 && Math.abs(diff) <= GRACE_MAX_INTERVAL
             && graceSlot >= MIN_TICK && graceSlot <= GRACE_MAX_TICK
-            && graceSlot * GRACE_MAIN_RATIO <= mainSlot) {
+            && graceSlot * GRACE_MAIN_RATIO <= mainSlot
+            && graceSlot * GRACE_MAIN_RATIO <= prevSlot) {
           next.start = g.start;               // 본음이 꾸밈음 자리를 넘겨받는다
           next.techniques.push(tech);
           continue;                           // 꾸밈음 그룹 자체는 버린다
@@ -1316,11 +1335,16 @@ function buildEvents(groups, tempos, instrument, techs) {
     cursor += g.duration;   // 목표 길이만큼 전진. 실제 표현과의 오차는 carry로 이월된다.
   }
 
+  /* 마지막 음 뒤에 남은 템포는 지운다.
+     화음을 템포 자리에서 끊다 보면 곡 끝에 아무것도 울리지 않는 템포가
+     하나 남을 수 있다. 소리에는 영향이 없고 글자수만 먹는다. */
+  while (events.length && events[events.length - 1].type === "Tempo") events.pop();
+
   return events;
 }
 
-/* 한 파트(트랙:채널)를 MML 이벤트 목록으로 만든다. */
-function buildTrackEvents(part, tempos, ppq, instrument) {
+/* 한 파트를 이벤트로 만들기 직전 단계까지 준비한다. */
+function prepareTrack(part, ppq, instrument) {
   const techs = {
     staccato:  AUTO_TECHNIQUE ? techniqueOf(instrument, "staccato")  : null,
     accent:    AUTO_TECHNIQUE ? techniqueOf(instrument, "accent")    : null,
@@ -1331,7 +1355,62 @@ function buildTrackEvents(part, tempos, ppq, instrument) {
     mods: (part.mods || []).map(m => ({ pos: snap(toTick(m.tick, ppq)), value: m.value }))
                            .sort((a, b) => a.pos - b.pos)
   };
-  return buildEvents(makeGroups(part, instrument, ppq, techs), tempos, instrument, techs);
+  return { techs, groups: makeGroups(part, instrument, ppq, techs) };
+}
+
+/* ============================================================
+   템포 위치 맞추기 — 모든 트랙이 같은 자리에서 바뀌어야 한다
+   ============================================================
+   템포가 화음 한가운데에 걸리면 화음을 쪼갤 수 없으므로 화음 시작으로
+   당겨 붙인다. 그런데 트랙마다 화음이 놓인 자리가 다르다 보니, 같은 템포가
+   트랙마다 다른 시각에 적용되는 일이 생긴다.
+
+     T0 : ... t70 을 1056에 찍음
+     T1 : ... 1056이 긴 화음 안이라 768로 당겨짐
+
+   그러면 768~1056 구간에서 두 트랙의 속도가 달라지고, 그 차이만큼 어긋난
+   채로 곡이 끝까지 간다. 한 번 벌어지면 절대 회복되지 않는다.
+
+   그래서 템포를 찍기 전에 모든 트랙을 같이 보고, 어느 한 트랙이라도 당겨야
+   한다면 나머지도 같은 자리로 당긴다. 당긴 자리가 또 다른 트랙의 화음
+   한가운데면 다시 당긴다. 더 당길 곳이 없을 때까지 반복한다.
+
+   템포가 조금 일찍 바뀌는 것은 귀에 거의 안 띄지만,
+   트랙이 어긋나는 것은 곡 전체가 망가진다. ============================================================ */
+function alignTempos(groupsByTrack, tempos) {
+  const out = tempos.map(t => ({ pos: t.pos, bpm: t.bpm }));
+
+  for (const t of out) {
+    if (t.pos <= 0) continue;
+    for (let guard = 0; guard < 16; guard++) {
+      let moved = false;
+      for (const groups of groupsByTrack) {
+        for (let i = 0; i < groups.length; i++) {
+          const g = groups[i];
+          if (g.start >= t.pos) break;
+          if (g.notes.length < 2) continue;          // 단음은 쪼갤 수 있다
+          const next = groups[i + 1];
+          const slot = next ? next.start - g.start : g.fullDur;
+          const dur = Math.max(MIN_TICK, Math.min(g.fullDur, slot));
+          // 화음은 템포 자리에서 끊어 쓰므로, 끊기에도 너무 이른 경우만 당긴다
+          if (t.pos > g.start && t.pos < g.start + dur && t.pos - g.start < MIN_TICK) {
+            t.pos = g.start; moved = true; break;
+          }
+        }
+        if (moved) break;
+      }
+      if (!moved) break;
+    }
+  }
+
+  // 같은 자리로 몰린 템포는 마지막 것만 남긴다
+  out.sort((a, b) => a.pos - b.pos);
+  const merged = [];
+  for (const t of out) {
+    if (merged.length && merged[merged.length - 1].pos === t.pos) merged[merged.length - 1] = t;
+    else merged.push(t);
+  }
+  return merged;
 }
 
 function eventToMml(e) {
@@ -1456,9 +1535,15 @@ function convert(buffer) {
    삽입한다 — 마비꼬와 달리 Armis는 모든 트랙에 템포가 들어가야 한다.
    (단, 그 트랙이 끝난 뒤의 템포는 마비꼬처럼 붙이지 않는다) */
 function rebuild(song) {
+  /* 1) 파트별 그룹을 먼저 만들고
+     2) 모든 트랙을 같이 보며 템포 위치를 맞춘 뒤
+     3) 그 템포로 각 트랙을 찍는다. 순서를 지켜야 트랙이 어긋나지 않는다. */
+  const prepared = song.parts.map(p => ({ p, ...prepareTrack(p.part, song.ppq, p.armis) }));
+  const tempoList = alignTempos(prepared.map(x => x.groups), song.tempoList);
+
   const tracks = [];
-  for (const p of song.parts) {
-    const events = buildTrackEvents(p.part, song.tempoList, song.ppq, p.armis);
+  for (const { p, groups, techs } of prepared) {
+    const events = buildEvents(groups, tempoList, p.armis, techs);
     if (!events.some(e => e.type === "Note")) continue;
     tracks.push({ owner: p, events, label: p.label });
   }
