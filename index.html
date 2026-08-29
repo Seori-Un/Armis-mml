@@ -299,6 +299,13 @@ const VIBRATO_CC_MIN = 40;
    "아주 짧은 음 하나 + 바로 뒤에 붙은 긴 음"을 한 음 + 기법으로 묶는다.
    본음이 꾸밈음의 자리까지 넘겨받으므로 박자는 그대로다.
    조건을 좁게 잡지 않으면 빠른 멜로디가 통째로 꾸밈음으로 먹히니 주의. */
+/* 글리산도처럼 아주 빠르게 흐르는 음들은 격자에 맞추면 한 자리로 뭉쳐
+   반음 클러스터 화음이 되어 버린다. 원래는 순서대로 흐르던 소리다.
+   그래서 "원본에서는 시간차가 있었고 음정이 붙어 있는" 묶음은 화음으로
+   보지 않고 1/64음표 간격으로 펼친다. 자리가 모자라면 솎아 낸다. */
+const CLUSTER_MIN_NOTES = 3;      // 이 개수 이상 뭉쳤을 때만 검사한다
+const CLUSTER_RAW_SPREAD = 2;     // 원본에서 이만큼은 시간차가 있었어야 한다
+
 const GRACE_MAX_INTERVAL = 2;        // 본음과 반음 2개 이내 (1~2도)
 const GRACE_MAX_TICK = WHOLE / 32;   // 꾸밈음 자리가 1/32음표 이하
 const GRACE_MAIN_RATIO = 4;          // 본음이 꾸밈음보다 이 배 이상 길어야 한다
@@ -989,6 +996,7 @@ function makeGroups(part, instrument, ppq, techs) {
       pitch: keyToPitchClass(key),
       octave: keyToOctave(key),
       velocity: trimVelocity(velocityToMml(n.velocity), key, instrument),
+      raw:   toTick(n.startTick, ppq),          // 격자에 맞추기 전 위치
       start: snap(toTick(n.startTick, ppq)),
       end:   snap(toTick(n.endTick, ppq))
     };
@@ -1010,6 +1018,71 @@ function makeGroups(part, instrument, ppq, techs) {
     } else {
       groups.push({ start: n.start, notes: [n], techniques: [] });
     }
+  }
+
+  /* 글리산도 펼치기.
+     한 자리에 뭉친 음들이
+       · 원본에서는 시간차가 있었고 (동시에 친 화음이 아니다)
+       · 음정이 다닥다닥 붙어 있으면 (도-도#-레 같은 반음 덩어리)
+     그건 화음이 아니라 빠르게 흐르던 음들이다. 그대로 쌓으면
+     반음 클러스터가 되어 굉장히 지저분하게 들린다.
+
+     다음 음이 시작하기 전까지의 자리에 1/64음표 간격으로 펼치고,
+     자리가 모자라면 고르게 솎아 낸다. 음 하나하나보다 훑고 지나가는
+     느낌이 중요하므로 몇 개 빠져도 글리산도로 들린다. */
+  {
+    const spread = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      const ns = g.notes;
+      if (ns.length < CLUSTER_MIN_NOTES) { spread.push(g); continue; }
+
+      /* 시간 순서대로 훑으며 "한 방향으로 반음~온음씩 움직이는" 가장 긴 구간을
+         찾는다. 이 구간만 글리산도로 보고 펼친다.
+
+         묶음 전체를 보면 안 된다. 옥타브 아래 베이스가 하나 섞여 있으면
+         음정 폭이 넓어져서 글리산도를 놓치기 때문이다. 실제로
+         g+ 하나가 낀 탓에 반음 4개짜리 클러스터가 그대로 남아 있었다. */
+      const byRaw = ns.slice().sort((a, b) => a.raw - b.raw);
+      let from = 0, to = 0;
+      for (let a2 = 0; a2 < byRaw.length; a2++) {
+        for (const dir of [1, -1]) {
+          let e = a2;
+          while (e + 1 < byRaw.length) {
+            const step = (byRaw[e + 1].key - byRaw[e].key) * dir;
+            if (step < 1 || step > 2) break;    // 반음~온음씩 한 방향으로
+            e++;
+          }
+          if (e - a2 > to - from) { from = a2; to = e; }
+        }
+      }
+      const run = byRaw.slice(from, to + 1);
+      const runSpread = run.length > 1 ? run[run.length - 1].raw - run[0].raw : 0;
+      if (run.length < CLUSTER_MIN_NOTES || runSpread < CLUSTER_RAW_SPREAD) {
+        spread.push(g);
+        continue;
+      }
+      const rest = byRaw.filter(n => run.indexOf(n) < 0);   // 글리산도가 아닌 음들
+
+      const next = groups[i + 1];
+      const slot = next ? next.start - g.start : Math.max(...ns.map(n => n.end)) - g.start;
+      const room = Math.max(1, Math.floor(slot / MIN_TICK));
+      const order = run;
+      const keep = Math.min(order.length, room);
+
+      for (let k = 0; k < keep; k++) {
+        // 고르게 솎아 낸다 (앞뒤 끝은 반드시 남긴다)
+        const idx = keep === 1 ? 0 : Math.round(k * (order.length - 1) / (keep - 1));
+        const n = order[idx];
+        const at = g.start + k * MIN_TICK;
+        // 글리산도가 아닌 음들은 첫 조각에 같이 둔다 (원래 자리에서 울리도록)
+        const notes = [{ ...n, start: at, end: Math.max(at + MIN_TICK, n.end) }];
+        if (k === 0) for (const r of rest) notes.push({ ...r, start: at });
+        notes.sort((x, y) => x.key - y.key);
+        spread.push({ start: at, notes, techniques: [] });
+      }
+    }
+    groups = spread;
   }
 
   /* 꾸밈음 — 짧은 음 하나를 뒤 음의 *8 / *9로 흡수한다.
